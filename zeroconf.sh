@@ -33,7 +33,7 @@ case $PHASE in
 	;;
     config)
 	/bin/ip addr del $ip/16 dev $IFACE
-	/bin/ip addr add $ip/16 dev $IFACE
+	/bin/ip addr add $ip/16 scope link dev $IFACE
 	exit 0
 	;;
     deconfig)
