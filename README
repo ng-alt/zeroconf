@@ -1,0 +1,72 @@
+
+zeroconf
+--------
+
+Zeroconf is a program that you can use to claim IPv4 link-local (LL)
+addresses.  IPv4 LL addresses are useful if you wish to setup ad-hoc
+networking between devices without the involvement of a either a DHCP
+server or your (very busy) network administrator.
+
+These addresses are allocated from the 169.254.0.0/16 address range
+and are normally attached to each Ethernet device in your computer.
+Addresses are assigned randomly by each host and, in case of
+collision, both hosts (are supposed to) renumber.
+
+IPv4 LL networking, coupled with DNS Service Discovery (DNS-SD),
+allows you to connect printers, cameras and, of course, other
+computers together and things will "Just Work".  All without a
+centralised DHCP or DNS server.
+
+That means making it possible to take two laptop computers, and
+connect them with a crossover Ethernet cable, and have them
+communicate usefully using IP, without needing a man in a white lab
+coat to set it all up for you. (from www.zeroconf.org)
+
+Zeroconf was written to have minimal dependancies, be very small and
+be reasonably portable.  Additionally it should be very simple to drop
+into place for any Linux distribution.
+
+Standards
+---------
+
+Zeroconf aims to implement, and to the best of my knowledge does,
+RFC3927 "Dynamic Configuration of IPv4 Link-Local Addresses".  It has
+not been tested for interoperability with any other IPv4LL clients --
+any reports (good or bad) would be welcome.
+
+Homepage
+--------
+
+Further information about this zeroconf program is available from
+<URL: http://www.progsoc.org/~wildfire/zeroconf/>
+
+Licence
+-------
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as
+published by the Free Software Foundation; either version 2.1 of the
+License, or (at your option) any later version.
+
+This library is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public
+License along with this library; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
+USA or alternatively see <http://www.gnu.org/copyleft/lesser.html>
+
+
+Acknowledgements
+----------------
+
+Without the initial code written by Arthur van Hoff this would not
+have been possible.
+
+Contact
+-------
+
+If you have any further queries about zeroconf, please contact:
+Anand Kumria <akumria@acm.org>

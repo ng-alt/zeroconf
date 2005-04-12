@@ -1,0 +1,10 @@
+
+DEFINITE
+- use syslog for important events (use)
+- use syslog if verbose is specified
+- proper signal handling
+- create /var/run/zeroconf.<iface>.pid
+- go through RFC looking for specification and/or issues
+
+MAYBE
+- interface to d-bus, broadcat new address claim?
