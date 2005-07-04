@@ -1,0 +1,30 @@
+#!/bin/sh
+
+# IPv4 link-local addresses (zeroconf) are
+# only applicable on the 'inet' address family
+[[ "X$ADDRFAM" -ne "Xinet" ]] && exit 0
+
+# However there are some methods where it doesn't
+# make any sense to configure an IPv4LL address
+
+# not on loopback
+[[ "X$METHOD" -eq "Xloopback" ]] && exit 0
+
+# not on ppp or wvdial either
+[[ "X$METHOD" -eq "Xppp" ]] && exit 0
+[[ "X$METHOD" -eq "Xwvdial" ]] && exit 0
+
+# The administrator may have blacklisted interfaces
+[[ -f /etc/default/zeroconf ]] &&
+    . /etc/default/zeroconf
+
+for $BLACK in $IFBLACKLIST;
+    case $IFACE in
+	$BLACK)
+	exit 0
+	;;
+    esac
+done
+
+# otherwise, we are good to go
+/usr/local/sbin/zeroconf -i $IFACE
