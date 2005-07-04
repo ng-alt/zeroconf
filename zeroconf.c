@@ -36,9 +36,6 @@
 
 #define LINKLOCAL_ADDR          0xa9fe0000
 #define LINKLOCAL_MASK          0xFFFF0000
-#define PROBE_INTERVAL          200
-#define NCLAIMS                 3
-#define CLAIM_INTERVAL          200
 #define FAILURE_INTERVAL        14000
 #define DEFAULT_INTERFACE       "eth0"
 #define DEFAULT_SCRIPT          "/etc/zeroconf"
@@ -51,16 +48,17 @@
 #define ANNOUNCE_NUM         2 /*         (number of announcement packets) */
 #define ANNOUNCE_INTERVAL    2 /*seconds  (time between announcement packets) */
 #define ANNOUNCE_WAIT        2 /*seconds  (delay before announcing) */
-#define MAX_COLLISIONS      10 /*         (max collisions before rate limiting) */
+#define MAX_CONFLICTS       10 /*         (max conflicts before rate limiting) */
 #define RATE_LIMIT_INTERVAL 60 /*seconds  (delay between successive attempts) */
 #define DEFEND_INTERVAL     10 /*seconds  (minimum interval between defensive ARPs). */
 
 enum {
   ADDR_PROBE,
   ADDR_PROBE_WAIT,
-  ADDR_PROBE_COLLIDE,
+  ADDR_PROBE_CONFLICT,
   ADDR_PROBE_RATELIMIT,
   ADDR_CLAIM,
+  ADDR_TAKE,
   ADDR_DEFEND,
   ADDR_DEFEND_FINAL
 };
@@ -68,6 +66,7 @@ enum {
 
 static char *prog;
 static int verbose = 0;
+int conflict_count = 4; /* ak */ /* start off at 4 for APPLE */
 
 static struct in_addr null_ip = {0};
 static struct ether_addr null_addr = {{0, 0, 0, 0, 0, 0}};
@@ -209,6 +208,79 @@ static unsigned int gen_msec_timeout(unsigned int min_seconds, unsigned int max_
   return ((abs(random()) % max_msec) + min_msec);
 }
 
+static int check_arp_conflict(int fd, 
+			      const char* intf, 
+			      struct in_addr ip,
+			      struct ether_addr addr)
+{
+  struct arp_packet p;
+
+  /* we might have a conflict */
+  if (recv(fd, &p, sizeof(p), 0) < 0) {
+    perror("recv failed");
+    exit(1);
+  }
+
+  if (verbose) {
+    printf("%s %s: recv arp type=%d, op=%d, ", prog, intf, ntohs(p.hdr.ether_type), ntohs(p.arp.ar_op));
+    printf("source=%s %s,", ether2str(&p.source_addr), inet_ntoa(p.source_ip));
+    printf("target=%s %s\n", ether2str(&p.target_addr), inet_ntoa(p.target_ip));
+    printf("trying=%s\n",inet_ntoa(ip));
+    printf("target=%s\n",ether2str(&addr));
+  }
+
+  /* two types of conflicts:
+   *
+   * 1. another node is also sending out a simultaneous probe for 
+   * the address we are using - this is done va ARPOP_REQUEST
+   * and it's source IP address will be null and the target IP address
+   * will match (additionally the source hardware address will not be
+   * our own -- in case of 'echoed' packets)
+   *
+   * 2. another node already has the same address - this is done via
+   * ARPOP_REPLY with the source IP address set to our candidate IP
+   * address. The target IP address will be broadcast, since we used
+   * that in our probe, but it will be directed to our MAC address
+   */
+
+  if (ntohs(p.hdr.ether_type) != ETHERTYPE_ARP)
+    return 0;
+
+  /* okay an ARP packet, let's check more deeply */
+
+  if (ntohs(p.arp.ar_op) == ARPOP_REQUEST) {
+
+    /* conflict 1? */
+    if ((p.source_ip.s_addr == null_ip.s_addr) &&
+	(p.target_ip.s_addr == ip.s_addr)) {
+
+      conflict_count++;
+	
+      return 1;
+		
+    }
+
+  } else if (ntohs(p.arp.ar_op) == ARPOP_REPLY) {
+
+    /* conflict 2? */
+    if ((p.source_ip.s_addr == ip.s_addr) &&
+	(p.target_ip.s_addr == null_ip.s_addr)) { /*&&
+						    (memcmp(&addr, &p.target_addr, ETH_ALEN) != 0)) {*/
+
+      conflict_count++;
+
+      return 1;
+
+    }
+
+  } else {
+    if (verbose) {
+      printf("arp packet but didn't seem to be for us\n");
+    }
+  }
+  return 0;
+}
+
 /**
  * main program
  */
@@ -218,20 +290,23 @@ int main(int argc, char *argv[])
   char *script = strdup(DEFAULT_SCRIPT);
   struct sockaddr saddr;
   struct pollfd fds[1];
-  struct arp_packet p;
   struct ifreq ifr;
   struct ether_addr addr;
   struct timeval tv;
   struct in_addr ip = {0};
-  int fd;
+  int fd; /* ak */
   int quit = 0;
   int ready = 0;
   int foreground = 0;
-  int timeout = 0;
-  int nprobes = 0;
+  int timeout = 0; /* ak */
+  int nprobes = 0; /* ak */
   int nclaims = 0;
   int failby = 0;
+  int notime = 0; /* ak */
+  int ioevents = 0; /* ak */
+  int next_state = 0; /* ak */
   int i = 1;
+  int zeroconf_state = ADDR_PROBE; /* ak */
 
   // init
   gettimeofday(&tv, NULL);
@@ -328,77 +403,89 @@ int main(int argc, char *argv[])
     }
     fds[0].revents = 0;
     switch (poll(fds, 1, timeout)) {
-    case 0:
-      // timeout
-      if ((failby != 0) && (failby < time(0))) {
-	fprintf(stderr, "%s %s: failed to obtain address\n", prog, intf);
-	exit(1);
+    case 0: /* timeout */
+      if (verbose) {
+	fprintf(stderr, "%s: timeout\n", prog);
       }
-      if (nprobes < PROBE_NUM) {
+      ioevents = 0;
+      notime = 1;
+      break;
+
+    case 1: /* I/O events */
+      if (verbose) {
+	fprintf(stderr, "%s: ioevents\n", prog);
+      }
+      notime = 0;
+      ioevents = 1;
+      break;
+
+    default:
+      /* something odd, abort */
+      fprintf(stderr, "%s: unexpect fd returned\n", prog);
+      exit(1);
+      break;
+    }
+
+    /* we use next_state to 'continue' to loop around so the
+     * state machine.  Unless we say 'break' at the end, we
+     * can put each action into a each state
+     */
+    next_state = 1;
+    while (next_state) {
+
+      switch (zeroconf_state) {
+    
+      case ADDR_PROBE:
 	// ARP probe
 	if (verbose) {
 	  fprintf(stderr, "%s %s: ARP probe %s\n", prog, intf, inet_ntoa(ip));
 	}
+
 	arp(fd, &saddr, ARPOP_REQUEST, &addr, null_ip, &null_addr, ip);
 	nprobes++;
-	timeout = gen_msec_timeout(PROBE_MIN, PROBE_MAX);
-      } else if (nclaims < NCLAIMS) {
-	// ARP claim
-	if (verbose) {
-	  fprintf(stderr, "%s %s: ARP claim %s\n", prog, intf, inet_ntoa(ip));
-	}
-	arp(fd, &saddr, ARPOP_REQUEST, &addr, ip, &addr, ip);
-	nclaims++;
-	timeout = CLAIM_INTERVAL;
-      } else {
-	// ARP take
-	if (verbose) {
-	  fprintf(stderr, "%s %s: use %s\n", prog, intf, inet_ntoa(ip));
-	}
-	ready = 1;
-	timeout = -1;
-	failby = 0;
-	run(script, "config", intf, &ip);
 
-	if (quit) {
-	  exit(0);
+	if (nprobes < PROBE_NUM) {
+	  timeout = gen_msec_timeout(PROBE_MIN, PROBE_MAX);
+	} else {
+	  timeout = ANNOUNCE_WAIT * 1000;
 	}
-	if (!foreground) {
-	  if (daemon(0, 0) < 0) {
-	    perror("daemon failed");
-	    exit(1);
+
+	zeroconf_state = ADDR_PROBE_WAIT;
+	break;
+
+      case ADDR_PROBE_WAIT:
+	if (ioevents) {
+	  if (check_arp_conflict(fd,intf,ip,addr)) {
+	    zeroconf_state = ADDR_PROBE_CONFLICT;
+	    continue;
 	  }
 	}
-      }
-      break;
 
-    case 1:
-      // i/o event
-      if ((fds[0].revents & POLLIN) == 0) {
-	if (fds[0].revents & POLLERR) {
-	  fprintf(stderr, "%s %s: I/O error\n", prog, intf);
-	  exit(1);
+	if (notime) {
+
+	  /* excellent, nothing happened */
+	  if (nprobes < PROBE_NUM) {
+
+	    if (conflict_count < MAX_CONFLICTS) {
+	      zeroconf_state = ADDR_PROBE;
+	      continue;
+	    } else {
+	      zeroconf_state = ADDR_PROBE_RATELIMIT;
+	      continue;
+	    }
+
+	  } else {
+	    zeroconf_state = ADDR_CLAIM;
+	    continue;
+	  }
+
 	}
-	continue;
-      }
+	break;
 
-      // read ARP packet
-      if (recv(fd, &p, sizeof(p), 0) < 0) {
-	perror("recv failed");
-	exit(1);
-      }
-
-      if (verbose) {
-	printf("%s %s: recv arp type=%d, op=%d, ", prog, intf, ntohs(p.hdr.ether_type), ntohs(p.arp.ar_op));
-	printf("source=%s %s,", ether2str(&p.source_addr), inet_ntoa(p.source_ip));
-	printf("target=%s %s\n", ether2str(&p.target_addr), inet_ntoa(p.target_ip));
-      }
-
-      if ((ntohs(p.hdr.ether_type) == ETHERTYPE_ARP) && (ntohs(p.arp.ar_op) == ARPOP_REPLY) &&
-	  (p.target_ip.s_addr == ip.s_addr) && (memcmp(&addr, &p.target_addr, ETH_ALEN) != 0)) {
+      case ADDR_PROBE_CONFLICT:
 
 	if (verbose) {
-	  fprintf(stderr, "%s %s: ARP conflict %s\n", prog, intf, inet_ntoa(ip));
+	  fprintf(stderr, "%s %s: ARP conflict %s (%d)\n", prog, intf, inet_ntoa(ip), conflict_count);
 	}
 
 	/* if we've already assigned the address, remove it 
@@ -408,16 +495,125 @@ int main(int argc, char *argv[])
 	  ready = 0;
 	  run(script, "deconfig", intf, &ip);
 	}
+
 	pick(&ip);
-	timeout = 0;
+
+	/*
+	 * resetting everything here will allow us to reuse the
+	 * state logic in the PROBE_WAIT case
+	 */
 	nprobes = 0;
 	nclaims = 0;
-      }
-      break;
+	ioevents = 0;
+	timeout = 0;
+	notime = 0;
 
-    default:
-      perror("poll failed");
-      exit(1);
+	zeroconf_state = ADDR_PROBE_WAIT;
+	continue;
+
+	break;
+
+      case ADDR_PROBE_RATELIMIT:
+
+	/* too many conflicts, let's back keeping trying but slower */
+	arp(fd, &saddr, ARPOP_REQUEST, &addr, null_ip, &null_addr, ip);
+	timeout = RATE_LIMIT_INTERVAL * 1000;
+
+	break;
+
+      case ADDR_CLAIM:
+
+	if (verbose) {
+	  fprintf(stderr, "%s %s: ARP claim %s\n", prog, intf, inet_ntoa(ip));
+	}
+
+	arp(fd, &saddr, ARPOP_REQUEST, &addr, ip, &addr, ip);
+	nclaims++;
+	timeout = ANNOUNCE_INTERVAL * 1000;
+
+	if (nclaims >= ANNOUNCE_NUM) {
+	  zeroconf_state = ADDR_TAKE;
+	} else {
+	  zeroconf_state = ADDR_CLAIM;
+	}
+
+	break;
+
+      case ADDR_TAKE:
+	if (verbose) {
+	  fprintf(stderr, "%s %s: use %s\n", prog, intf, inet_ntoa(ip));
+	}	
+
+	ready = 1;
+	timeout = -1;
+	failby = 0;
+	run(script, "config", intf, &ip);
+
+	if (quit) {
+	  exit(0);
+	}
+
+	if (!foreground) {
+	  if (daemon(0, 0) < 0) {
+	    perror("daemon failed");
+	    exit(1);
+	  }
+	}
+
+	zeroconf_state = ADDR_DEFEND;
+
+	break;
+
+      case ADDR_DEFEND:
+	/*
+	 * check if it is for our address, if so, perform defence
+	 * i.e. send an address clam
+	 * then move to _DEFEND_FINAL and set timeout to DEFEND_INTERVAL
+	 */
+	if (check_arp_conflict(fd,intf,ip,addr)) {
+	  /* send defence packet */
+	  timeout = DEFEND_INTERVAL * 1000;
+	  zeroconf_state = ADDR_DEFEND_FINAL;
+	}
+
+	break;
+
+      case ADDR_DEFEND_FINAL:
+	/* if another conflicting arp packet is received, remove our address,
+	 * reset everything and go back to addr_probe
+	 */
+	if (check_arp_conflict(fd,intf,ip,addr)) {
+	  
+	  if (ready) {
+	    ready = 0;
+	    run(script, "deconfig", intf, &ip);
+	  }
+	  
+	  nclaims = 0;
+	  nprobes = 0;
+	  conflict_count = 0;
+	  zeroconf_state = ADDR_PROBE;
+	  
+	}
+
+	break;
+
+      default:
+	fprintf(stderr, "%s %s: unexpected zeroconf state\n", prog, intf);
+	exit(1);
+	break;
+
+
+	if ((failby != 0) && (failby < time(0))) {
+	  fprintf(stderr, "%s %s: failed to obtain address\n", prog, intf);
+	  exit(1);
+	}
+
+      }
+
+      next_state = 0;
+
     }
   }
 }
+

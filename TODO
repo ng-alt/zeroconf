@@ -30,7 +30,7 @@ STATES:
 
 - 2.4: address claim state machine
   a claim must be sent every ANNOUNCE_INTERVAL seconds for at most
-  ANNOUNCE_NUM times
+  ANNOUNCE_NUM times; the timeout interval is NOT modified by any shorter timeouts (especially those in section 2.3)
 
 STATES:
 	- perform address claim					     | ADDR_CLAIM
@@ -93,3 +93,14 @@ DEFINITE
 MAYBE
 - interface to d-bus, broadcat new address claim?
 - use DNAv4?
+
+CHECK
+- use seconday address 'feature' in 2.6.12
+- does address removal result in session shutdown for TCP?
+
+since RFC3927
+- MUST NOT send queries for 254.169.in-addr.arpa
+- DNS servers MUST fail the query
+- link addresses can be now be use for source OR destination; previously only source
+- section 2.6.1 conflicts with the SHOULD NOT requirement mentioned earlier about assigning an interface both an IPv4 routeable and a link-local
+- routers MUST NOT forward if an IPv4ll address is either src or dest.
