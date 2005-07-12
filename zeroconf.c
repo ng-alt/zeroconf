@@ -50,6 +50,7 @@
 #define ANNOUNCE_WAIT        2 /*seconds  (delay before announcing) */
 #define MAX_CONFLICTS       10 /*         (max conflicts before rate limiting) */
 #define RATE_LIMIT_INTERVAL 60 /*seconds  (delay between successive attempts) */
+#define RATE_LIMIT_INTERVAL_APPLE 1 /*seconds  (delay between successive attempts) */
 #define DEFEND_INTERVAL     10 /*seconds  (minimum interval between defensive ARPs). */
 
 enum {
@@ -515,9 +516,14 @@ int main(int argc, char *argv[])
 
       case ADDR_PROBE_RATELIMIT:
 
-	/* too many conflicts, let's back keeping trying but slower */
+	/* too many conflicts, let's back off and keeping trying but slower */
+	if (verbose) {
+	  fprintf(stderr, "%s %s: ARP ratelimit probe %s\n", prog, intf, inet_ntoa(ip));
+	}
 	arp(fd, &saddr, ARPOP_REQUEST, &addr, null_ip, &null_addr, ip);
-	timeout = RATE_LIMIT_INTERVAL * 1000;
+	nprobes++;
+	timeout = RATE_LIMIT_INTERVAL_APPLE * 1000;
+	zeroconf_state = ADDR_PROBE_WAIT;
 
 	break;
 

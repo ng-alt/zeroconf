@@ -2,23 +2,24 @@
 
 # IPv4 link-local addresses (zeroconf) are
 # only applicable on the 'inet' address family
-[[ "X$ADDRFAM" -ne "Xinet" ]] && exit 0
+[ "X$ADDRFAM" != "Xinet" ] && exit 0
 
 # However there are some methods where it doesn't
 # make any sense to configure an IPv4LL address
 
 # not on loopback
-[[ "X$METHOD" -eq "Xloopback" ]] && exit 0
+[ "X$METHOD" = "Xloopback" ] && exit 0
 
 # not on ppp or wvdial either
-[[ "X$METHOD" -eq "Xppp" ]] && exit 0
-[[ "X$METHOD" -eq "Xwvdial" ]] && exit 0
+[ "X$METHOD" = "Xppp" ] && exit 0
+[ "X$METHOD" = "Xwvdial" ] && exit 0
 
 # The administrator may have blacklisted interfaces
-[[ -f /etc/default/zeroconf ]] &&
+# or only want zeroconf in a fallback situation
+[ -f /etc/default/zeroconf ] &&
     . /etc/default/zeroconf
 
-for $BLACK in $IFBLACKLIST;
+for BLACK in $IFBLACKLIST; do
     case $IFACE in
 	$BLACK)
 	exit 0
@@ -26,5 +27,14 @@ for $BLACK in $IFBLACKLIST;
     esac
 done
 
+# should we only allocate an address if we do not already have one?
+if [ -n "$FALLBACK" ]; then
+    /bin/ip addr show $IFACE scope global | grep -q "inet"
+    IP=$?
+    [ $IP -eq 0 ] && exit 0
+fi
+
 # otherwise, we are good to go
 /usr/local/sbin/zeroconf -i $IFACE
+
+exit 0

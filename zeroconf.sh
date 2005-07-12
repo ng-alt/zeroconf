@@ -14,6 +14,8 @@
 # deconfig is used to remove an IP address
 # from an interface
 
+# ip is supplied by the zeroconf program in the environment
+
 if [ $# -lt 2 ]; then
     /usr/bin/printf "$0: error. insufficient arguments\n"
     /usr/bin/printf "usage: $0 <phase> <interface>\n"
@@ -26,18 +28,23 @@ fi
 PHASE=$1
 IFACE=$2
 
+remove_linklocal_addrs() 
+{
+    ip addr show $IFACE | grep "inet.*169.254" | cut -d" " -f6 | xargs --replace -n 1 ip addr del {} dev $IFACE
+}
+
 case $PHASE in
     init)
 	/bin/ip link set $IFACE up
 	exit 0
 	;;
     config)
-	/bin/ip addr del $ip/16 dev $IFACE
+	remove_linklocal_addrs
 	/bin/ip addr add $ip/16 scope link dev $IFACE
 	exit 0
 	;;
     deconfig)
-	/bin/ip addr del $ip/16 dev $IFACE
+	remove_linklocal_addrs
 	exit 0
     ;;
 esac
