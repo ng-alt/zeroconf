@@ -97,6 +97,7 @@ MAYBE
 CHECK
 - use seconday address 'feature' in 2.6.12
 - does address removal result in session shutdown for TCP?
+- 169.254.0.0/16 on multiple networks; does an ARP occur on each? or on one?
 
 since RFC3927
 - MUST NOT send queries for 254.169.in-addr.arpa

@@ -206,7 +206,7 @@ static unsigned int gen_msec_timeout(unsigned int min_seconds, unsigned int max_
   unsigned int max_msec = max_seconds * 1000;
   unsigned int min_msec = min_seconds * 1000;
 
-  return ((abs(random()) % max_msec) + min_msec);
+  return ((abs(random()) % (max_msec - min_msec)) + min_msec);
 }
 
 static int check_arp_conflict(int fd, 
@@ -233,7 +233,7 @@ static int check_arp_conflict(int fd,
   /* two types of conflicts:
    *
    * 1. another node is also sending out a simultaneous probe for 
-   * the address we are using - this is done va ARPOP_REQUEST
+   * the address we are using - this is done via ARPOP_REQUEST
    * and it's source IP address will be null and the target IP address
    * will match (additionally the source hardware address will not be
    * our own -- in case of 'echoed' packets)
@@ -282,6 +282,57 @@ static int check_arp_conflict(int fd,
   return 0;
 }
 
+/* 
+ * Subtract the `struct timeval' values X and Y,
+ *  storing the result in RESULT.
+ *  Return 1 if the difference is negative, otherwise 0.  
+ *  taken from the GNU Lib C documentation
+ */
+static int
+timeval_subtract(struct timeval *result, struct timeval *x, struct timeval *y)
+{
+  /* Perform the carry for the later subtraction by updating Y. */
+  if (x->tv_usec < y->tv_usec) {
+    int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
+    y->tv_usec -= 1000000 * nsec;
+    y->tv_sec += nsec;
+  }
+  if (x->tv_usec - y->tv_usec > 1000000) {
+    int nsec = (x->tv_usec - y->tv_usec) / 1000000;
+    y->tv_usec += 1000000 * nsec;
+    y->tv_sec -= nsec;
+  }
+
+  /* 
+   * Compute the time remaining to wait.
+   *  `tv_usec' is certainly positive. 
+   */
+  result->tv_sec = x->tv_sec - y->tv_sec;
+  result->tv_usec = x->tv_usec - y->tv_usec;
+
+  /* Return 1 if result is negative. */
+  return x->tv_sec < y->tv_sec;
+}
+
+static void reduce_timeout(int *timeout, struct timeval tv1)
+{
+  struct timeval result, tv2;
+
+  gettimeofday(&tv2,NULL);
+
+  /* timeout = timeout - tv2 - tv1; */
+
+  timeval_subtract(&result, &tv2, &tv1);
+
+  timeout = timeout - (result.tv_sec * 1000) - (result.tv_usec % 1000);
+
+  /* we could have actually used up all our time too! */
+  if (timeout < 0)
+    timeout = 0;
+
+}
+
+
 /**
  * main program
  */
@@ -310,10 +361,9 @@ int main(int argc, char *argv[])
   int zeroconf_state = ADDR_PROBE; /* ak */
 
   // init
-  gettimeofday(&tv, NULL);
   prog = argv[0];
 
-  // parse arguments
+  /* parse arguments */
   while (i < argc) {
     char *arg = argv[i++];
     if (strcmp(arg, "-q") == 0) {
@@ -391,6 +441,7 @@ int main(int argc, char *argv[])
 
   /* RFC 2.2.1
    * initial timeout is between 0 and PROBE_WAIT seconds
+   * FIXME: actually it is the amount we should wait before continuing;
    */
   timeout = gen_msec_timeout(0, PROBE_WAIT);
 
@@ -403,6 +454,7 @@ int main(int argc, char *argv[])
       printf("%s %s: polling %d, nprobes=%d, nclaims=%d\n", prog, intf, timeout, nprobes, nclaims);
     }
     fds[0].revents = 0;
+    gettimeofday(&tv,NULL);
     switch (poll(fds, 1, timeout)) {
     case 0: /* timeout */
       if (verbose) {
@@ -459,6 +511,8 @@ int main(int argc, char *argv[])
 	  if (check_arp_conflict(fd,intf,ip,addr)) {
 	    zeroconf_state = ADDR_PROBE_CONFLICT;
 	    continue;
+	  } else {
+	    reduce_timeout(&timeout, tv);
 	  }
 	}
 
@@ -540,7 +594,7 @@ int main(int argc, char *argv[])
 	if (nclaims >= ANNOUNCE_NUM) {
 	  zeroconf_state = ADDR_TAKE;
 	} else {
-	  zeroconf_state = ADDR_CLAIM;
+	  zeroconf_state = ADDR_PROBE_WAIT;
 	}
 
 	break;
@@ -578,6 +632,7 @@ int main(int argc, char *argv[])
 	 */
 	if (check_arp_conflict(fd,intf,ip,addr)) {
 	  /* send defence packet */
+	  arp(fd, &saddr, ARPOP_REQUEST, &addr, ip, &addr, ip);
 	  timeout = DEFEND_INTERVAL * 1000;
 	  zeroconf_state = ADDR_DEFEND_FINAL;
 	}
@@ -599,8 +654,14 @@ int main(int argc, char *argv[])
 	  nprobes = 0;
 	  conflict_count = 0;
 	  zeroconf_state = ADDR_PROBE;
-	  
+	  continue;
 	}
+
+	reduce_timeout(&timeout, tv);
+
+	/* if we've run out of time, our defence must have been successful */
+	if (notime)
+	  zeroconf_state = ADDR_DEFEND;
 
 	break;
 
