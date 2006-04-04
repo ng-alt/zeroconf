@@ -5,7 +5,7 @@ CWARN= -W -Wall -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations 
 
 CFLAGS=$(CWARN) -MMD -O2 -g
 
-SRCS=zeroconf.c
+SRCS=zeroconf.c delay.c
 
 OBJS= $(SRCS:.c=.o)
 
@@ -16,7 +16,7 @@ all: $(TARGET)
 clean:
 	rm -f $(TARGET) $(OBJS) *.d
 
-zeroconf: zeroconf.o
+zeroconf: zeroconf.o delay.o
 	$(Q)echo "Creating $@"
 	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 

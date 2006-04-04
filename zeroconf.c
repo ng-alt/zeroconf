@@ -1,686 +1,1553 @@
 /*
- * Simple IPv4 Link-Local addressing (see <http://www.zeroconf.org/>)
- * @(#)llip.c, 1.5, Copyright 2003 by Arthur van Hoff (avh@strangeberry.com)
- * Copyright 2005 (c) Anand Kumria 
- * 
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- * See <http://www.gnu.org/copyleft/lesser.html>
- * 
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
+ * zeroconf.c
+ *
+ * Copyright (c) 2006 Anand Kumria
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * See the file COPYING for the full details
+ *
  */
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/types.h>
-#include <sys/poll.h>
-#include <sys/wait.h>
-#include <sys/time.h>
-#include <time.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/ether.h>
-#include <net/ethernet.h>
-#include <net/if.h>
-#include <net/if_arp.h>
-#include <linux/if_packet.h>
-#include <linux/sockios.h>
+#include <sys/socket.h>
+#include <linux/rtnetlink.h>
+#include <linux/if.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define _GNU_SOURCE
+#include <getopt.h>
+#undef _GNU_SOURCE
+#include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/poll.h>
 #include <sys/ioctl.h>
+#include <netpacket/packet.h>
+#include <net/ethernet.h>
+#include <arpa/inet.h>
+#include <net/if_arp.h>
+#include <sys/time.h>
+#include <signal.h>
 
-#define LINKLOCAL_ADDR          0xa9fe0000
-#define LINKLOCAL_MASK          0xFFFF0000
-#define FAILURE_INTERVAL        14000
-#define DEFAULT_INTERFACE       "eth0"
-#define DEFAULT_SCRIPT          "/etc/zeroconf"
+#include "delay.h"
 
-/* Constants from RFC3927 */
-#define PROBE_WAIT           1 /*second   (initial random delay) */
-#define PROBE_MIN            1 /*second   (minimum delay till repeated probe) */
-#define PROBE_MAX            2 /*seconds  (maximum delay till repeated probe) */
-#define PROBE_NUM            3 /*         (number of probe packets) */
-#define ANNOUNCE_NUM         2 /*         (number of announcement packets) */
-#define ANNOUNCE_INTERVAL    2 /*seconds  (time between announcement packets) */
-#define ANNOUNCE_WAIT        2 /*seconds  (delay before announcing) */
-#define MAX_CONFLICTS       10 /*         (max conflicts before rate limiting) */
-#define RATE_LIMIT_INTERVAL 60 /*seconds  (delay between successive attempts) */
-#define RATE_LIMIT_INTERVAL_APPLE 1 /*seconds  (delay between successive attempts) */
-#define DEFEND_INTERVAL     10 /*seconds  (minimum interval between defensive ARPs). */
+/* constants from RFC2937 */
+#define PROBE_WAIT           1 /*second  (initial random delay)              */
+#define PROBE_MIN            1 /*second  (minimum delay till repeated probe) */
+#define PROBE_MAX            2 /*seconds (maximum delay till repeated probe) */
+#define PROBE_NUM            3 /*         (number of probe packets)          */
+#define ANNOUNCE_NUM         2 /*        (number of announcement packets)    */
+#define ANNOUNCE_INTERVAL    2 /*seconds (time between announcement packets) */
+#define ANNOUNCE_WAIT        2 /*seconds  (delay before announcing)          */
+#define MAX_CONFLICTS       10 /*        (max conflicts before rate limiting)*/
+#define RATE_LIMIT_INTERVAL 60 /*seconds (delay between successive attempts) */
+#define DEFEND_INTERVAL     10 /*seconds (min. wait between defensive ARPs)  */
 
+/* compilation constants */
+#define NLBUF 512
+#define ARP_IP_PROTO 2048
+
+/* some helpful macros */
+#define FLAG_TEST_DUMP(x, y) if (x & y) fprintf(stderr,"%s ",#y);
+
+/* our state machine */
 enum {
+  ADDR_INIT,
   ADDR_PROBE,
-  ADDR_PROBE_WAIT,
-  ADDR_PROBE_CONFLICT,
-  ADDR_PROBE_RATELIMIT,
   ADDR_CLAIM,
   ADDR_TAKE,
   ADDR_DEFEND,
-  ADDR_DEFEND_FINAL
+  ADDR_FINAL,
+  ADDR_RELEASE
 };
 
+/* structures */
+struct intf {
+  char              name[IFNAMSIZ+1];
+  int               index;
+  unsigned int      flags;
+  int               up;
+  struct ether_addr mac;
+  struct in_addr    ip;
+};
 
-static char *prog;
-static int verbose = 0;
-int conflict_count = 4; /* ak */ /* start off at 4 for APPLE */
-
-static struct in_addr null_ip = {0};
-static struct ether_addr null_addr = {{0, 0, 0, 0, 0, 0}};
-static struct ether_addr broadcast_addr = {{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}};
-
-/**
- * ARP packet.
- */
 struct arp_packet {
-  struct ether_header hdr;
-  struct arphdr arp;
-  struct ether_addr source_addr;
-  struct in_addr source_ip;
-  struct ether_addr target_addr; 
-  struct in_addr target_ip;
-  unsigned char pad[18];
-} __attribute__ ((__packed__));
+  struct arphdr       arp;
+  struct ether_addr   sender_mac;
+  struct in_addr      sender_ip;
+  struct ether_addr   target_mac;
+  struct in_addr      target_ip;
+  unsigned char       reserved[18];
+} __attribute__ ((packed));
 
+/* forward declarations */
+void check_args(int argc, char * const argv[], struct intf *intf);
+int  netlink_open(int proto, __u32 groups);
+int  netlink_close(int nl);
+int  netlink_send(int nl, struct nlmsghdr *n);
+void netlink_dump(struct nlmsghdr *n);
+void netlink_dump_rta(struct rtattr *rta, int length, int family);
+void netlink_link_is_up(struct intf *intf, struct nlmsghdr *n);
+int  netlink_qualify(struct nlmsghdr *n, size_t length);
+void netlink_addr_add(int nl, struct intf *intf);
+void netlink_addr_del(int nl, struct intf *intf);
+int  check_ifname_exists(int nl, struct intf *intf);
+int  check_ifname_type(struct intf *intf);
+int  arp_open(struct intf *intf);
+int  arp_conflict(struct intf *intf, struct arp_packet *pkt);
+void arp_packet_dump(struct arp_packet *pkt);
+void arp_packet_send(int as, 
+		     struct intf *intf, 
+		     short int arp_op, 
+		     int null_sender);
+void arp_probe(int as, struct intf *intf);
+void arp_claim(int as, struct intf *intf);
+void arp_defend(int as, struct intf *intf);
+void usage(void);
+int  signal_install(int signo);
+int addattr_l(struct nlmsghdr *n, unsigned int maxlen, int type, const void *data, int alen);
 
-/**
- * Convert an ethernet address to a printable string.
- */
-static char *ether2str(const struct ether_addr *addr)
+/* globals */
+int force = 0;
+int verbose = 0;
+int nofork = 0;
+
+int probe_count = 0;
+int conflict_count = 0;
+int claim_count = 0;
+int address_picked = 0;
+
+int self_pipe[2] = { -1, -1 };
+
+static void sig_handler(int signo)
 {
-  static char str[32];
-  snprintf(str, sizeof(str), "%02X:%02X:%02X:%02X:%02X:%02X",
-	   addr->ether_addr_octet[0], addr->ether_addr_octet[1],
-	   addr->ether_addr_octet[2], addr->ether_addr_octet[3],
-	   addr->ether_addr_octet[4], addr->ether_addr_octet[5]);
-  return str;
+  write(self_pipe[1], &signo, sizeof(signo));
 }
 
 
-/**
- * Pick a random link local IP address.
- */
-static void pick(struct in_addr *ip)
+int main(int argc, char **argv)
 {
-  /* IPv4 LL address are in the 169.254.0.0/16 network
-   * - but 169.254.0.0/24 and 169.254.255.0/24 are reserved
-   * - leaving 65024 usable addresses
-   */
-  ip->s_addr = htonl(LINKLOCAL_ADDR | ((abs(random()) % 0xFD00) + 0x0100));
-}
 
-/**
- * Send out an ARP packet.
- */
-static void arp(int fd, struct sockaddr *saddr, int op,
-                struct ether_addr *source_addr, struct in_addr source_ip,
-                struct ether_addr *target_addr, struct in_addr target_ip)
-{
-  struct arp_packet p;
-  memset(&p, 0, sizeof(p));
+  int nl, as;
+  int keep_running = 1;
+  struct itimerval  delay;
 
-  // ether header
-  p.hdr.ether_type = htons(ETHERTYPE_ARP);
-  memcpy(p.hdr.ether_shost, source_addr, ETH_ALEN);
-  memcpy(p.hdr.ether_dhost, &broadcast_addr, ETH_ALEN);
+  struct intf intf = {
+    .index = -1,
+    .flags = 0,
+    .up = 0,
+  };
 
-  // arp request
-  p.arp.ar_hrd = htons(ARPHRD_ETHER);
-  p.arp.ar_pro = htons(ETHERTYPE_IP);
-  p.arp.ar_hln = ETH_ALEN;
-  p.arp.ar_pln = 4;
-  p.arp.ar_op = htons(op);
-  memcpy(&p.source_addr, source_addr, ETH_ALEN);
-  memcpy(&p.source_ip, &source_ip, sizeof(p.source_ip));
-  memcpy(&p.target_addr, target_addr, ETH_ALEN);
-  memcpy(&p.target_ip, &target_ip, sizeof(p.target_ip));
+  check_args(argc, argv, &intf);
 
-  // send it
-  if (sendto(fd, &p, sizeof(p), 0, saddr, sizeof(*saddr)) < 0) {
-    perror("sendto failed");
+  if ((nl = netlink_open(NETLINK_ROUTE, 0)) < 0) {
+    fprintf(stderr,"unable to connect to netlink\n");
     exit(1);
   }
-}
 
-/**
- * Run a script.
- */
-static void run(char *script, const char *arg, char *intf, struct in_addr *ip)
-{
-  int pid, status;
+  if (check_ifname_exists(nl, &intf) < 0) {
+    fprintf(stderr,"Interface %s does not exist\n", intf.name);
+    exit(1);
+  }
 
-  if (script != NULL) {
-    if (verbose) {
-      fprintf(stderr, "%s %s: run %s %s\n", prog, intf, script, arg);
-    }
-    pid = fork();
-    if (pid < 0) {
-      perror("fork failed");
+  if ((check_ifname_type(&intf) < 0) && (!force)) {
+    fprintf(stderr,"Interface %s (%d) not suitable for zeroconf\n",
+	    intf.name, intf.index);
+    exit(1);
+  }
+
+  if ((as = arp_open(&intf)) < 0) {
+    fprintf(stderr,"unable to obtain ARP socket: %s\n",strerror(errno));
+    exit(1);
+  }
+
+  /* convert our generic netlink socket into one which only
+   * reports link, ipv4 address and ipv4 route events
+   */
+  if (netlink_close(nl) < 0) {
+    fprintf(stderr,"netlink close error: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if ((nl = netlink_open(NETLINK_ROUTE, 
+			 RTMGRP_LINK|RTMGRP_IPV4_IFADDR|RTMGRP_IPV4_ROUTE))< 0){
+    fprintf(stderr,"unable to connect to netlink groups\n");
+    exit(1);
+  }
+
+  if (!nofork)
+    daemon(0, 0);
+
+  /* write /var/run/zeroconf.intf.pid */
+  {
+    char pidloc[PATH_MAX];
+    FILE *pidfile;
+    
+    if (snprintf(pidloc, PATH_MAX, "/var/run/zeroconf.%s.pid", intf.name) < 0) {
+      fprintf(stderr,"unable to construct pid file location: %s\n", strerror(errno));
       exit(1);
     }
-    if (pid == 0) {
-      // child process
-      setenv("interface", intf, 1);
-      if (ip != NULL) {
-	setenv("ip", inet_ntoa(*ip), 1);
+
+    pidfile = fopen(pidloc, "w+");
+
+    if (pidfile != NULL) {
+
+      fprintf(pidfile,"%d\n",getpid());
+
+      fclose(pidfile);
+
+    } else {
+
+      fprintf(stderr,"unable to create pid file (%s): %s\n", pidloc, strerror(errno));
+
+    }
+
+  }
+  
+
+  /* setup random number generator
+   * we key this off the MAC-48 HW identifier
+   * the first 3 octets are the manufacturer
+   * the next 3 the serial number
+   * we'll use the last four for the largest variety
+   */
+  srandom((intf.mac.ether_addr_octet[2] << 24) | 
+	  (intf.mac.ether_addr_octet[3] << 16) |
+	  (intf.mac.ether_addr_octet[4] <<  8) | 
+	  (intf.mac.ether_addr_octet[5] <<  0)  );
+
+  /* handle signals
+   * SIGALARM: set delay_timeout = 1
+   * SIGTERM : perform address release and exit
+   * SIGINT  : perform address release and exit
+   * SIGHUP  : perform address release and re-init
+   */
+
+  if (pipe(self_pipe) < 0) {
+    fprintf(stderr,"unable to create self-pipe fds: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (fcntl(self_pipe[0], F_SETFL, O_NONBLOCK) < 0) {
+    fprintf(stderr,"unable to set self-pipe fd non-blocking: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (fcntl(self_pipe[1], F_SETFL, O_NONBLOCK) < 0) {
+    fprintf(stderr,"unable to set self-pipe fd non-blocking: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (signal_install(SIGALRM) < 0) {
+    fprintf(stderr,"unable to install SIGALRM: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (signal_install(SIGTERM) < 0) {
+    fprintf(stderr,"unable to install SIGTERM: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (signal_install(SIGINT) < 0) {
+    fprintf(stderr,"unable to install SIGINT: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  if (signal_install(SIGHUP) < 0) {
+    fprintf(stderr,"unable to install SIGHUP: %s\n", strerror(errno));
+    exit(1);
+  }
+
+  /* setup an immediate delay to kick things off */
+
+  delay_setup_immed(&delay);
+
+  delay_run(&delay);
+
+  while (keep_running) {
+
+    static int state = ADDR_INIT;
+
+    struct pollfd     fds[3];
+    struct arp_packet *pkt;
+    struct nlmsghdr   *n;
+
+    int           timeout;
+    unsigned char replybuf[4096];
+
+    timeout = 0;
+    pkt = NULL;
+    n = NULL;
+
+    fds[0].fd = nl;
+    fds[0].events = POLLIN|POLLERR;
+    fds[1].fd = as;
+    fds[1].events = POLLIN|POLLERR;
+    fds[2].fd = self_pipe[0];
+    fds[2].events = POLLIN|POLLERR;
+    
+    switch (poll(fds, 3, -1)) {
+    case -1:
+      /* signals are handled as file descriptors via the self-pipe */
+      if (errno == EINTR)
+	continue;
+
+      fprintf(stderr,"poll err: %s\n",strerror(errno));
+      exit(1);
+      break;
+    case 0:
+      fprintf(stderr,"poll timed out during infinity\n");
+      exit(1);
+      break;
+    default:
+      {
+	
+	ssize_t ret;
+
+	/* okay, one of our descriptors has been changed
+	 * pull the data out, processing takes place later
+	 */
+
+	/* netlink */
+	if (fds[0].revents) {
+	  int i;
+	
+	  n = (struct nlmsghdr *)&replybuf;
+	  if (verbose)
+	    fprintf(stderr,"netlink event\n");
+	  ret = recv(fds[0].fd, replybuf, sizeof(replybuf), 0);
+#if 0
+	  for (i = 0; i < ret; i++)
+	    fprintf(stderr,"!%02X",replybuf[i]);
+	  fprintf(stderr,"\n");
+#endif
+	  if (verbose)
+	    netlink_dump(n);
+
+	  if (netlink_qualify(n, ret) < 0)
+	    n = NULL;
+
+	}
+
+	/* arp packet */
+	if (fds[1].revents) {
+	  if (verbose)
+	    fprintf(stderr,"arp event\n");
+	  ret = recv(fds[1].fd, replybuf, sizeof(replybuf), 0);
+	  pkt = (struct arp_packet *)&replybuf;
+	  if (verbose)
+	    arp_packet_dump(pkt);      
+	  intf.up = 1;
+	}
+
+	/* signal */
+	if (fds[2].revents) {
+	  int signo;
+	  ret = read(fds[2].fd, &signo, sizeof(signo));
+	  if (ret < 0)
+	    fprintf(stderr,"signal read failed: %s\n", strerror(errno));
+
+	  if (verbose)
+	    fprintf(stderr,"signal %d\n",signo);
+
+	  if (ret == sizeof(signo)) {
+	    switch(signo) {
+	    case SIGALRM:
+	      delay_timeout = 1;
+	      delay_is_running = 0;
+	      break;
+	    case SIGINT:
+	    case SIGTERM:
+	      state = ADDR_RELEASE;
+	      keep_running = 0;
+	      break;
+	    case SIGHUP:
+	      state = ADDR_RELEASE;
+	      break;
+	    default:
+	      fprintf(stderr,"unhandled signal %d\n", signo);
+	      break;
+	    }
+	  }
+	}
+
+      }
+      break;
+    }
+
+    /* ARP could possibly have various types of address formats.
+     * Only Ethernet, IP protocol addresses and
+     * ARP_REQUESTs or ARP_REPLYs are interesting
+     */
+    if ((pkt) &&
+	(ntohs(pkt->arp.ar_hrd) != ARPHRD_ETHER) && 
+	(ntohs(pkt->arp.ar_pro) != ARP_IP_PROTO) &&
+	(
+	 (ntohs(pkt->arp.ar_op) != ARPOP_REQUEST) || 
+	 (ntohs(pkt->arp.ar_op) != ARPOP_REPLY)
+	)
+       ) {
+      pkt = NULL;
+    }
+
+    if (n) {
+      netlink_link_is_up(&intf, n);
+
+      /* TODO: if we got an unexpected RTM_DELADDR or 
+       * RTM_DELROUTE and it refers to our address, 
+       * reset everything via ADDR_INIT
+       */
+
+    }
+
+    /* if we aren't up, continue waiting */
+    if (!intf.up) {
+
+      /* cancel any pending timers */
+      if (setitimer(ITIMER_REAL, NULL, NULL)<0) {
+	fprintf(stderr, "failed to cancel timer: %s\n", strerror(errno));
       }
 
-      execl(script, script, arg, intf, NULL);
-      perror("execl failed");
+      delay_timeout = 0;
+      delay_is_running = 0;
+      state = ADDR_RELEASE;
+
+      continue;
+    }
+
+    switch (state) {
+    case ADDR_INIT:
+      {
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_INIT\n");
+
+	delay_setup_random(&delay, 0, PROBE_WAIT);
+
+	delay_run(&delay);
+
+	probe_count = 0;
+	conflict_count = 0;
+	claim_count = 0;
+	address_picked = 0;
+
+	state = ADDR_PROBE;
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_INIT\n");
+      }
+      break;
+    case ADDR_PROBE:
+      {
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_PROBE\n");
+
+	delay_wait();
+
+	if (arp_conflict(&intf, pkt)) {
+	  conflict_count++;
+	  address_picked = 0;
+	  probe_count = 0;
+	}
+
+	if (!delay_is_waiting()) {
+
+	  if (!address_picked) {
+
+	    /*
+	     * pick random IP address in IPv4 link-local range
+	     * 169.254.0.0/16 (0xa9fe0000) is the allowed address range
+	     * however 169.254.0.0/24 and 169.254.255.0/24 must be
+	     * excluded, which removes 512 address from our 65535
+	     * candidates. That leaves us with 65023 (0xfdff) to which
+	     * we add 256 (0x0100) to make sure it is within range.
+	     */
+	    
+	    intf.ip.s_addr = htonl(0xa9fe0000 | 
+				    ((abs(random()) % 0xfdff) + 0x0100));
+
+	    if (verbose)
+	      fprintf(stderr,"picked address: %s\n", inet_ntoa(intf.ip));
+
+	    address_picked = 1;
+
+	  }
+
+	  arp_probe(as, &intf);
+
+	  probe_count++;
+
+	}
+
+	if (probe_count >= PROBE_NUM) {
+	  state = ADDR_CLAIM;
+
+	  delay_setup_fixed(&delay, ANNOUNCE_WAIT);
+
+	  delay_run(&delay);
+
+	  if (verbose) /* really only here to make things look tidy */
+	    fprintf(stderr,"leaving  ADDR_PROBE\n");
+	  break;
+	}
+
+	if (conflict_count > MAX_CONFLICTS) {
+
+	  delay_setup_fixed(&delay, RATE_LIMIT_INTERVAL);
+
+	} else {
+
+	  delay_setup_random(&delay, PROBE_MIN, PROBE_MAX);
+
+	}
+
+	delay_run(&delay);
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_PROBE\n");
+      }
+      break;
+    case ADDR_CLAIM:
+      {
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_CLAIM\n");
+
+	if (arp_conflict(&intf, pkt)) {
+	  state = ADDR_PROBE;
+
+	  delay_setup_immed(&delay);
+
+	  delay_run(&delay);
+
+	  if (verbose)
+	    fprintf(stderr,"leaving  ADDR_CLAIM\n");
+	  break;
+	}
+
+	delay_wait();
+
+	arp_claim(as, &intf);
+
+	claim_count++;
+
+	if (claim_count >= ANNOUNCE_NUM) {
+	  state = ADDR_TAKE;
+
+	  delay_setup_immed(&delay);
+
+	  delay_run(&delay);
+
+	  if (verbose)
+	    fprintf(stderr,"leaving  ADDR_CLAIM\n");
+	  break;
+	}
+
+	delay_setup_fixed(&delay, ANNOUNCE_INTERVAL);
+
+	delay_run(&delay);
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_CLAIM\n");
+      }
+      break;
+    case ADDR_TAKE:
+      {
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_TAKE\n");
+
+	delay_wait();
+
+	netlink_addr_add(nl, &intf);
+
+	state = ADDR_DEFEND;
+
+	delay_setup_immed(&delay);
+
+	delay_run(&delay);
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_TAKE\n");
+      }
+      break;
+    case ADDR_DEFEND:
+      {
+
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_DEFEND\n");
+
+	if (arp_conflict(&intf, pkt)) {
+
+	  arp_defend(as, &intf);
+
+	  delay_setup_immed(&delay);
+
+	  delay_run(&delay);
+
+	  state = ADDR_FINAL;
+
+	  /* no need to break here, since we fall out anyway */
+	}
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_DEFEND\n");
+      }
+      break;
+    case ADDR_FINAL:
+      {
+
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_FINAL\n");
+
+	if (arp_conflict(&intf, pkt)) {
+	  state = ADDR_RELEASE;
+
+	  delay_setup_fixed(&delay, DEFEND_INTERVAL);
+
+	  delay_run(&delay);
+
+	  if (verbose)
+	    fprintf(stderr,"leaving  ADDR_FINAL\n");
+	  break;
+	}
+
+	delay_setup_fixed(&delay, DEFEND_INTERVAL);
+
+	delay_run(&delay);
+
+	delay_wait();
+
+	/* we get here only if the timeout has 
+	 * finished and there were no conflicts
+	 */
+	state = ADDR_DEFEND;
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_FINAL\n");
+      }
+      break;
+    case ADDR_RELEASE:
+      {
+
+	if (verbose)
+	  fprintf(stderr,"entering ADDR_RELEASE\n");
+
+	netlink_addr_del(nl, &intf);
+
+	delay_setup_immed(&delay);
+
+	delay_run(&delay);
+
+	state = ADDR_INIT;
+
+	if (verbose)
+	  fprintf(stderr,"leaving  ADDR_RELEASE\n");
+      }
+      break;
+    default:
+      fprintf(stderr,"unhandled state\n");
       exit(1);
     }
-    if (waitpid(pid, &status, 0) <= 0) {
-      perror("waitpid failed");
-      exit(1);
-    }
-    if (WEXITSTATUS(status) != 0) {
-      fprintf(stderr, "%s: script %s failed, exit=%d\n", prog, script, WEXITSTATUS(status));
-      exit(1);
-    }
-  }
-}
 
-/**
- * Print usage information.
- */
-static void usage(const char *msg)
-{
-  fprintf(stderr, "%s: %s\n\n", prog, msg);
-  fprintf(stderr, "Usage: %s [OPTIONS]\n", prog);
-  fprintf(stderr, " -v                verbose\n");
-  fprintf(stderr, " -q                quit after obtaining address\n");
-  fprintf(stderr, " -f                do not fork a daemon\n");
-  fprintf(stderr, " -n                exit with failure if no address can be obtained\n");
-  fprintf(stderr, " -i <interface>    network interface (default %s)\n", DEFAULT_INTERFACE);
-  fprintf(stderr, " -s <script>       network script (default %s)\n", DEFAULT_SCRIPT);
-  fprintf(stderr, " -ip 169.254.x.x   try this address first\n");
-  exit(1);
-}
 
-static unsigned int gen_msec_timeout(unsigned int min_seconds, unsigned int max_seconds)
-{
-  unsigned int max_msec = max_seconds * 1000;
-  unsigned int min_msec = min_seconds * 1000;
-
-  return ((abs(random()) % (max_msec - min_msec)) + min_msec);
-}
-
-static int check_arp_conflict(int fd, 
-			      const char* intf, 
-			      struct in_addr ip,
-			      struct ether_addr addr)
-{
-  struct arp_packet p;
-
-  /* we might have a conflict */
-  if (recv(fd, &p, sizeof(p), 0) < 0) {
-    perror("recv failed");
-    exit(1);
   }
 
-  if (verbose) {
-    printf("%s %s: recv arp type=%d, op=%d, ", prog, intf, ntohs(p.hdr.ether_type), ntohs(p.arp.ar_op));
-    printf("source=%s %s,", ether2str(&p.source_addr), inet_ntoa(p.source_ip));
-    printf("target=%s %s\n", ether2str(&p.target_addr), inet_ntoa(p.target_ip));
-    printf("trying=%s\n",inet_ntoa(ip));
-    printf("target=%s\n",ether2str(&addr));
-  }
-
-  /* two types of conflicts:
-   *
-   * 1. another node is also sending out a simultaneous probe for 
-   * the address we are using - this is done via ARPOP_REQUEST
-   * and it's source IP address will be null and the target IP address
-   * will match (additionally the source hardware address will not be
-   * our own -- in case of 'echoed' packets)
-   *
-   * 2. another node already has the same address - this is done via
-   * ARPOP_REPLY with the source IP address set to our candidate IP
-   * address. The target IP address will be broadcast, since we used
-   * that in our probe, but it will be directed to our MAC address
-   */
-
-  if (ntohs(p.hdr.ether_type) != ETHERTYPE_ARP)
-    return 0;
-
-  /* okay an ARP packet, let's check more deeply */
-
-  if (ntohs(p.arp.ar_op) == ARPOP_REQUEST) {
-
-    /* conflict 1? */
-    if ((p.source_ip.s_addr == null_ip.s_addr) &&
-	(p.target_ip.s_addr == ip.s_addr)) {
-
-      conflict_count++;
-	
-      return 1;
-		
-    }
-
-  } else if (ntohs(p.arp.ar_op) == ARPOP_REPLY) {
-
-    /* conflict 2? */
-    if ((p.source_ip.s_addr == ip.s_addr) &&
-	(p.target_ip.s_addr == null_ip.s_addr)) { /*&&
-						    (memcmp(&addr, &p.target_addr, ETH_ALEN) != 0)) {*/
-
-      conflict_count++;
-
-      return 1;
-
-    }
-
-  } else {
-    if (verbose) {
-      printf("arp packet but didn't seem to be for us\n");
-    }
-  }
   return 0;
 }
 
-/* 
- * Subtract the `struct timeval' values X and Y,
- *  storing the result in RESULT.
- *  Return 1 if the difference is negative, otherwise 0.  
- *  taken from the GNU Lib C documentation
- */
-static int
-timeval_subtract(struct timeval *result, struct timeval *x, struct timeval *y)
+void check_args(int argc, char * const argv[], struct intf *intf)
 {
-  /* Perform the carry for the later subtraction by updating Y. */
-  if (x->tv_usec < y->tv_usec) {
-    int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
-    y->tv_usec -= 1000000 * nsec;
-    y->tv_sec += nsec;
-  }
-  if (x->tv_usec - y->tv_usec > 1000000) {
-    int nsec = (x->tv_usec - y->tv_usec) / 1000000;
-    y->tv_usec += 1000000 * nsec;
-    y->tv_sec -= nsec;
-  }
 
-  /* 
-   * Compute the time remaining to wait.
-   *  `tv_usec' is certainly positive. 
-   */
-  result->tv_sec = x->tv_sec - y->tv_sec;
-  result->tv_usec = x->tv_usec - y->tv_usec;
+  int ret;
+  int optindex = 0;
 
-  /* Return 1 if result is negative. */
-  return x->tv_sec < y->tv_sec;
-}
+  /* command line options */
+  static struct option opts[] = {
+    {"force",0,0,'f'},
+    {"interface",1,0,'i'},
+    {"no-fork",0,0,'n'},
+    {"ipaddr",1,0,'p'},
+    {"verbose",0,0,'v'},
+    {0,0,0,0}
+  };
 
-static void reduce_timeout(int *timeout, struct timeval tv1)
-{
-  struct timeval result, tv2;
-
-  gettimeofday(&tv2,NULL);
-
-  /* timeout = timeout - tv2 - tv1; */
-
-  timeval_subtract(&result, &tv2, &tv1);
-
-  timeout = timeout - (result.tv_sec * 1000) - (result.tv_usec % 1000);
-
-  /* we could have actually used up all our time too! */
-  if (timeout < 0)
-    timeout = 0;
-
-}
-
-
-/**
- * main program
- */
-int main(int argc, char *argv[])
-{
-  char *intf = strdup(DEFAULT_INTERFACE);
-  char *script = strdup(DEFAULT_SCRIPT);
-  struct sockaddr saddr;
-  struct pollfd fds[1];
-  struct ifreq ifr;
-  struct ether_addr addr;
-  struct timeval tv;
-  struct in_addr ip = {0};
-  int fd; /* ak */
-  int quit = 0;
-  int ready = 0;
-  int foreground = 0;
-  int timeout = 0; /* ak */
-  int nprobes = 0; /* ak */
-  int nclaims = 0;
-  int failby = 0;
-  int notime = 0; /* ak */
-  int ioevents = 0; /* ak */
-  int next_state = 0; /* ak */
-  int i = 1;
-  int zeroconf_state = ADDR_PROBE; /* ak */
-
-  // init
-  prog = argv[0];
-
-  /* parse arguments */
-  while (i < argc) {
-    char *arg = argv[i++];
-    if (strcmp(arg, "-q") == 0) {
-      quit = 1;
-    } else if (strcmp(arg, "-f") == 0) {
-      foreground = 1;
-    } else if (strcmp(arg, "-v") == 0) {
-      verbose = 1;
-    } else if (strcmp(arg, "-n") == 0) {
-      failby = time(0) + FAILURE_INTERVAL / 1000;
-    } else if (strcmp(arg, "-i") == 0) {
-      free(intf);
-      if ((intf = argv[i++]) == NULL) {
-	usage("interface name missing");
-      }
-    } else if (strcmp(arg, "-s") == 0) {
-      free(script);
-      if ((script = argv[i++]) == NULL) {
-	usage("script missing");
-      }
-    } else if (strcmp(arg, "-ip") == 0) {
-      char *ipstr = argv[i++];
-      if (ipstr == NULL) {
-	usage("ip address missing");
-      }
-      if (inet_aton(ipstr, &ip) == 0) {
-	usage("invalid ip address");
-      }
-      if ((ntohl(ip.s_addr) & LINKLOCAL_MASK) != LINKLOCAL_ADDR) {
-	usage("invalid linklocal address");
-      }
-    } else {
-      usage("invalid argument");
-    }
+  if (argc < 3) {
+    usage();
   }
 
-  // initialize saddr
-  memset(&saddr, 0, sizeof(saddr));
-  strncpy(saddr.sa_data, intf, sizeof(saddr.sa_data));
-
-  // open an ARP socket
-  if ((fd = socket(PF_PACKET, SOCK_PACKET, htons(ETH_P_ARP))) < 0) {
-    perror("open failed");
-    exit(1);
-  }
-
-  // bind to the ARP socket
-  if (bind(fd, &saddr, sizeof(saddr)) < 0) {
-    perror("bind failed");
-    exit(1);
-  }
-
-  // get the ethernet address of the interface
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, intf, sizeof(ifr.ifr_name));
-  if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-    perror("ioctl failed");
-    exit(1);
-  }
-  memcpy(&addr, &ifr.ifr_hwaddr.sa_data, ETHER_ADDR_LEN);
-
-  // initialize the interface
-  run(script, "init", intf, NULL);
-
-  // initialize pseudo random selection of IP addresses
-  srandom((addr.ether_addr_octet[ETHER_ADDR_LEN-4] << 24) |
-	  (addr.ether_addr_octet[ETHER_ADDR_LEN-3] << 16) |
-	  (addr.ether_addr_octet[ETHER_ADDR_LEN-2] <<  8) |
-	  (addr.ether_addr_octet[ETHER_ADDR_LEN-1] <<  0));
-    
-  // pick an ip address
-  if (ip.s_addr == 0) {
-    pick(&ip);
-  }
-
-  /* RFC 2.2.1
-   * initial timeout is between 0 and PROBE_WAIT seconds
-   * FIXME: actually it is the amount we should wait before continuing;
-   */
-  timeout = gen_msec_timeout(0, PROBE_WAIT);
-
-  // prepare for polling
-  fds[0].fd = fd;
-  fds[0].events = POLLIN | POLLERR;
-
+  memset(intf->name, 0, IFNAMSIZ+1);
+  
   while (1) {
-    if (verbose) {
-      printf("%s %s: polling %d, nprobes=%d, nclaims=%d\n", prog, intf, timeout, nprobes, nclaims);
-    }
-    fds[0].revents = 0;
-    gettimeofday(&tv,NULL);
-    switch (poll(fds, 1, timeout)) {
-    case 0: /* timeout */
-      if (verbose) {
-	fprintf(stderr, "%s: timeout\n", prog);
-      }
-      ioevents = 0;
-      notime = 1;
+#ifdef __KLIBC__    
+#define getopt_long(a, b, c, d, e) getopt(a, b, c);    
+#endif
+    ret = getopt_long(argc, argv, "fi:np:v", opts, &optindex);
+
+    if (ret == -1)
       break;
 
-    case 1: /* I/O events */
-      if (verbose) {
-	fprintf(stderr, "%s: ioevents\n", prog);
-      }
-      notime = 0;
-      ioevents = 1;
+    switch (ret) {
+    case 'f':
+      force = 1;
       break;
-
+    case 'i':
+      strncpy(intf->name,optarg,IFNAMSIZ);
+      break;
+    case 'n':
+      nofork = 1;
+      break;
+    case 'p':
+      fprintf(stderr,"XXX: not implemented\n"); /* TODO */
+      break;
+    case 'v':
+      verbose = 1;
+      break;
     default:
-      /* something odd, abort */
-      fprintf(stderr, "%s: unexpect fd returned\n", prog);
-      exit(1);
+      fprintf(stderr,"unknown option '%c'\n",ret);
+      usage();
       break;
     }
 
-    /* we use next_state to 'continue' to loop around so the
-     * state machine.  Unless we say 'break' at the end, we
-     * can put each action into a each state
-     */
-    next_state = 1;
-    while (next_state) {
-
-      switch (zeroconf_state) {
-    
-      case ADDR_PROBE:
-	// ARP probe
-	if (verbose) {
-	  fprintf(stderr, "%s %s: ARP probe %s\n", prog, intf, inet_ntoa(ip));
-	}
-
-	arp(fd, &saddr, ARPOP_REQUEST, &addr, null_ip, &null_addr, ip);
-	nprobes++;
-
-	if (nprobes < PROBE_NUM) {
-	  timeout = gen_msec_timeout(PROBE_MIN, PROBE_MAX);
-	} else {
-	  timeout = ANNOUNCE_WAIT * 1000;
-	}
-
-	zeroconf_state = ADDR_PROBE_WAIT;
-	break;
-
-      case ADDR_PROBE_WAIT:
-	if (ioevents) {
-	  if (check_arp_conflict(fd,intf,ip,addr)) {
-	    zeroconf_state = ADDR_PROBE_CONFLICT;
-	    continue;
-	  } else {
-	    reduce_timeout(&timeout, tv);
-	  }
-	}
-
-	if (notime) {
-
-	  /* excellent, nothing happened */
-	  if (nprobes < PROBE_NUM) {
-
-	    if (conflict_count < MAX_CONFLICTS) {
-	      zeroconf_state = ADDR_PROBE;
-	      continue;
-	    } else {
-	      zeroconf_state = ADDR_PROBE_RATELIMIT;
-	      continue;
-	    }
-
-	  } else {
-	    zeroconf_state = ADDR_CLAIM;
-	    continue;
-	  }
-
-	}
-	break;
-
-      case ADDR_PROBE_CONFLICT:
-
-	if (verbose) {
-	  fprintf(stderr, "%s %s: ARP conflict %s (%d)\n", prog, intf, inet_ntoa(ip), conflict_count);
-	}
-
-	/* if we've already assigned the address, remove it 
-	 * and grab another one and reset everything
-	 */
-	if (ready) {
-	  ready = 0;
-	  run(script, "deconfig", intf, &ip);
-	}
-
-	pick(&ip);
-
-	/*
-	 * resetting everything here will allow us to reuse the
-	 * state logic in the PROBE_WAIT case
-	 */
-	nprobes = 0;
-	nclaims = 0;
-	ioevents = 0;
-	timeout = 0;
-	notime = 0;
-
-	zeroconf_state = ADDR_PROBE_WAIT;
-	continue;
-
-	break;
-
-      case ADDR_PROBE_RATELIMIT:
-
-	/* too many conflicts, let's back off and keeping trying but slower */
-	if (verbose) {
-	  fprintf(stderr, "%s %s: ARP ratelimit probe %s\n", prog, intf, inet_ntoa(ip));
-	}
-	arp(fd, &saddr, ARPOP_REQUEST, &addr, null_ip, &null_addr, ip);
-	nprobes++;
-	timeout = RATE_LIMIT_INTERVAL_APPLE * 1000;
-	zeroconf_state = ADDR_PROBE_WAIT;
-
-	break;
-
-      case ADDR_CLAIM:
-
-	if (verbose) {
-	  fprintf(stderr, "%s %s: ARP claim %s\n", prog, intf, inet_ntoa(ip));
-	}
-
-	arp(fd, &saddr, ARPOP_REQUEST, &addr, ip, &addr, ip);
-	nclaims++;
-	timeout = ANNOUNCE_INTERVAL * 1000;
-
-	if (nclaims >= ANNOUNCE_NUM) {
-	  zeroconf_state = ADDR_TAKE;
-	} else {
-	  zeroconf_state = ADDR_PROBE_WAIT;
-	}
-
-	break;
-
-      case ADDR_TAKE:
-	if (verbose) {
-	  fprintf(stderr, "%s %s: use %s\n", prog, intf, inet_ntoa(ip));
-	}	
-
-	ready = 1;
-	timeout = -1;
-	failby = 0;
-	run(script, "config", intf, &ip);
-
-	if (quit) {
-	  exit(0);
-	}
-
-	if (!foreground) {
-	  if (daemon(0, 0) < 0) {
-	    perror("daemon failed");
-	    exit(1);
-	  }
-	}
-
-	zeroconf_state = ADDR_DEFEND;
-
-	break;
-
-      case ADDR_DEFEND:
-	/*
-	 * check if it is for our address, if so, perform defence
-	 * i.e. send an address clam
-	 * then move to _DEFEND_FINAL and set timeout to DEFEND_INTERVAL
-	 */
-	if (check_arp_conflict(fd,intf,ip,addr)) {
-	  /* send defence packet */
-	  arp(fd, &saddr, ARPOP_REQUEST, &addr, ip, &addr, ip);
-	  timeout = DEFEND_INTERVAL * 1000;
-	  zeroconf_state = ADDR_DEFEND_FINAL;
-	}
-
-	break;
-
-      case ADDR_DEFEND_FINAL:
-	/* if another conflicting arp packet is received, remove our address,
-	 * reset everything and go back to addr_probe
-	 */
-	if (check_arp_conflict(fd,intf,ip,addr)) {
-	  
-	  if (ready) {
-	    ready = 0;
-	    run(script, "deconfig", intf, &ip);
-	  }
-	  
-	  nclaims = 0;
-	  nprobes = 0;
-	  conflict_count = 0;
-	  zeroconf_state = ADDR_PROBE;
-	  continue;
-	}
-
-	reduce_timeout(&timeout, tv);
-
-	/* if we've run out of time, our defence must have been successful */
-	if (notime)
-	  zeroconf_state = ADDR_DEFEND;
-
-	break;
-
-      default:
-	fprintf(stderr, "%s %s: unexpected zeroconf state\n", prog, intf);
-	exit(1);
-	break;
-
-
-	if ((failby != 0) && (failby < time(0))) {
-	  fprintf(stderr, "%s %s: failed to obtain address\n", prog, intf);
-	  exit(1);
-	}
-
-      }
-
-      next_state = 0;
-
-    }
   }
+
+  if (strlen(intf->name) == 0) {
+    fprintf(stderr,"no interface specified\n");
+    exit(1);
+  }
+
 }
 
+int netlink_open(int proto, __u32 groups)
+{
+
+  int sock;
+  struct sockaddr_nl addr;
+
+  if ((sock = socket(PF_NETLINK, SOCK_RAW, proto)) < 0) {
+    fprintf(stderr,"socket(PF_NETLINK): %s\n", strerror(errno));
+    return sock;
+  }
+
+  memset(&addr, 0, sizeof(addr));
+
+  addr.nl_family = AF_NETLINK;
+  addr.nl_pid = getpid();
+  addr.nl_groups = groups;
+
+  if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    fprintf(stderr,"bind(): %s\n", strerror(errno));
+    return sock;
+  }
+
+  return sock;
+}
+
+int netlink_close(int nl)
+{
+  return close(nl);
+}
+
+int netlink_send(int nl, struct nlmsghdr *n)
+{
+
+  if ((nl < 0) || (!n)) 
+    return -1;
+
+  return send(nl, n, n->nlmsg_len, 0);
+
+}
+
+void netlink_dump(struct nlmsghdr *n)
+{
+  struct ifinfomsg *i;
+  struct ifaddrmsg *a;
+  struct rtmsg     *r;
+  int               l;
+
+  fprintf(stderr,"%u %u %u %u %u:",
+	  n->nlmsg_len,
+	  n->nlmsg_type,
+	  n->nlmsg_flags,
+	  n->nlmsg_seq,
+	  n->nlmsg_pid);
+
+  switch (n->nlmsg_type) {
+
+  case NLMSG_ERROR:
+    fprintf(stderr,"netlink error\n");
+    break;
+
+  case RTM_NEWLINK:
+    fprintf(stderr,"RTM_NEWLINK\n");
+    i = NLMSG_DATA(n);
+    l = NLMSG_PAYLOAD(n, sizeof(struct ifinfomsg));
+
+    fprintf(stderr,"ifinfomsg: %u %u %d %u %u ",i->ifi_family, i->ifi_type, i->ifi_index, i->ifi_flags, i->ifi_change);
+
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_UP);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_BROADCAST);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_DEBUG);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_LOOPBACK);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_POINTOPOINT);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_NOTRAILERS);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_RUNNING);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_NOARP);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_PROMISC);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_ALLMULTI);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_MASTER);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_SLAVE);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_MULTICAST);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_PORTSEL);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_AUTOMEDIA);
+    FLAG_TEST_DUMP(i->ifi_flags,IFF_DYNAMIC);
+
+    netlink_dump_rta(IFLA_RTA(i), l, i->ifi_family);
+
+    fprintf(stderr,"\n");
+    
+    break;
+  case RTM_NEWADDR:
+    fprintf(stderr,"RTM_NEWADDR\n");
+
+    a = NLMSG_DATA(n);
+    l = NLMSG_PAYLOAD(n, sizeof(struct ifaddrmsg));
+
+    fprintf(stderr,"ifaddrmsg: %u %u %u %u %d",
+	    a->ifa_family, a->ifa_prefixlen,
+	    a->ifa_flags, a->ifa_scope, a->ifa_index);
+
+    switch (a->ifa_family){
+    case AF_INET:
+      fprintf(stderr," AF_INET ");
+      break;
+    case AF_INET6:
+      fprintf(stderr," AF_INET6 ");
+      break;
+    default:
+      fprintf(stderr," AF unknown ");
+      break;
+    }
+
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_SECONDARY);
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_DEPRECATED);
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_TENTATIVE);
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_PERMANENT);
+
+    netlink_dump_rta(IFA_RTA(a), l, a->ifa_family);
+
+    fprintf(stderr,"\n");
+
+    break;
+  case RTM_DELADDR:
+    fprintf(stderr,"RTM_DELADDR\n");
+
+    a = NLMSG_DATA(n);
+    l = NLMSG_PAYLOAD(n, sizeof(struct ifaddrmsg));
+
+    fprintf(stderr,"ifaddrmsg: %u %u %u %u %d",
+	    a->ifa_family, a->ifa_prefixlen,
+	    a->ifa_flags, a->ifa_scope, a->ifa_index);
+
+    switch (a->ifa_family){
+    case AF_INET:
+      fprintf(stderr," AF_INET ");
+      break;
+    case AF_INET6:
+      fprintf(stderr," AF_INET6 ");
+      break;
+    default:
+      fprintf(stderr," AF unknown ");
+      break;
+    }
+
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_SECONDARY);
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_DEPRECATED);
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_TENTATIVE);
+    FLAG_TEST_DUMP(a->ifa_flags,IFA_F_PERMANENT);
+
+    netlink_dump_rta(IFA_RTA(a), l, a->ifa_family);
+
+    fprintf(stderr,"\n");
+    break;
+  case RTM_NEWROUTE:
+    fprintf(stderr,"RTM_NEWROUTE\n");
+
+    r = NLMSG_DATA(n);
+    l = NLMSG_PAYLOAD(n, sizeof(struct rtmsg));
+
+    fprintf(stderr,"rtmsg: %u %u %u %u %u %u %u %u %u",
+	    r->rtm_family, r->rtm_dst_len, r->rtm_src_len, 
+	    r->rtm_tos, r->rtm_table, r->rtm_protocol, 
+	    r->rtm_scope, r->rtm_type, r->rtm_flags);
+
+    switch (r->rtm_family){
+    case AF_INET:
+      fprintf(stderr," AF_INET ");
+      break;
+    case AF_INET6:
+      fprintf(stderr," AF_INET6 ");
+      break;
+    default:
+      fprintf(stderr," AF unknown ");
+      break;
+    }
+
+    FLAG_TEST_DUMP(r->rtm_flags, RTM_F_NOTIFY);
+    FLAG_TEST_DUMP(r->rtm_flags, RTM_F_CLONED);
+    FLAG_TEST_DUMP(r->rtm_flags, RTM_F_EQUALIZE);
+
+    netlink_dump_rta(RTM_RTA(r), l, r->rtm_family);
+
+    fprintf(stderr,"\n");
+    break;
+  case RTM_DELROUTE:
+    fprintf(stderr,"RTM_DELROUTE\n");
+
+    r = NLMSG_DATA(n);
+    l = NLMSG_PAYLOAD(n, sizeof(struct rtmsg));
+
+    fprintf(stderr,"rtmsg: %u %u %u %u %u %u %u %u %u",
+	    r->rtm_family, r->rtm_dst_len, r->rtm_src_len, 
+	    r->rtm_tos, r->rtm_table, r->rtm_protocol, 
+	    r->rtm_scope, r->rtm_type, r->rtm_flags);
+
+    switch (r->rtm_family){
+    case AF_INET:
+      fprintf(stderr," AF_INET ");
+      break;
+    case AF_INET6:
+      fprintf(stderr," AF_INET6 ");
+      break;
+    default:
+      fprintf(stderr," AF unknown ");
+      break;
+    }
+
+    FLAG_TEST_DUMP(r->rtm_flags, RTM_F_NOTIFY);
+    FLAG_TEST_DUMP(r->rtm_flags, RTM_F_CLONED);
+    FLAG_TEST_DUMP(r->rtm_flags, RTM_F_EQUALIZE);
+
+    netlink_dump_rta(RTM_RTA(r), l, r->rtm_family);
+
+    fprintf(stderr,"\n");
+    break;
+  }
+
+  fprintf(stderr,"\n");
+}
+
+
+void netlink_dump_rta(struct rtattr *rta, int length, int family)
+{
+
+  struct rtnl_link_stats *stats;
+  struct rtnl_link_ifmap *map;
+  unsigned char          *addr;
+
+  /* family is a kludge so we know what format to
+   * print IFLA_ADDRESS and IFLA_BROADCAST in
+   */
+
+  while (RTA_OK(rta,length)) {
+
+    fprintf(stderr,", %u %u:", rta->rta_len, rta->rta_type);
+
+    switch(rta->rta_type) {
+    case IFLA_UNSPEC:
+      fprintf(stderr,"IFLA_UNSPEC");
+      break;
+    case IFLA_ADDRESS:
+      fprintf(stderr,"IFLA_ADDRESS ");
+      addr = (unsigned char *)RTA_DATA(rta);
+      switch (family) {
+      case AF_INET:
+	fprintf(stderr,"%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+	break;
+      default:
+	/* assume only print 6 - it's wrong but I can't see a better way */
+	fprintf(stderr,"%02X:%02X:%02X:%02X:%02X:%02X",addr[0],addr[1],addr[2],addr[3],addr[4],addr[5]);
+	break;
+      }
+      break;
+    case IFLA_BROADCAST:
+      fprintf(stderr,"IFLA_BROADCAST ");
+      addr = (unsigned char *)RTA_DATA(rta);
+      switch (family) {
+      case AF_INET:
+	fprintf(stderr,"%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+	break;
+      default:
+	/* assume only print 6 - it's wrong but I can't see a better way */
+	fprintf(stderr,"%02X:%02X:%02X:%02X:%02X:%02X",addr[0],addr[1],addr[2],addr[3],addr[4],addr[5]);
+	break;
+      }
+      break;
+    case IFLA_IFNAME:
+      fprintf(stderr,"IFLA_IFNAME: %s", (char *)RTA_DATA(rta));
+      break;
+    case IFLA_MTU:
+      fprintf(stderr,"IFLA_MTU: %u", (unsigned int)RTA_DATA(rta));
+      break;
+    case IFLA_LINK:
+      fprintf(stderr,"IFLA_LINK: %d", (int)RTA_DATA(rta));
+      break;
+    case IFLA_QDISC:
+      fprintf(stderr,"IFLA_QDISC: %s", (char *)RTA_DATA(rta));
+      break;
+    case IFLA_STATS:
+      fprintf(stderr,"IFLA_STATS");
+      stats = (struct rtnl_link_stats *)RTA_DATA(rta);
+      break;
+    case IFLA_COST:
+      fprintf(stderr,"IFLA_COST");
+      break;
+    case IFLA_PRIORITY:
+      fprintf(stderr,"IFLA_PRIORITY");
+      break;
+    case IFLA_MASTER:
+      fprintf(stderr,"IFLA_MASTER: %u",(unsigned int)RTA_DATA(rta));
+      break;
+    case IFLA_WIRELESS:
+      fprintf(stderr,"IFLA_WIRELESS");
+      break;
+    case IFLA_PROTINFO:
+      fprintf(stderr,"IFLA_PROTINFO");
+      break;
+    case IFLA_TXQLEN:
+      fprintf(stderr,"IFLA_TXQLEN: %u",(unsigned int)RTA_DATA(rta));
+      break;
+    case IFLA_MAP:
+      map = (struct rtnl_link_ifmap *)RTA_DATA(rta);
+      fprintf(stderr,"IFLA_MAP");
+      break;
+    case IFLA_WEIGHT:
+      fprintf(stderr,"IFLA_WEIGHT: %u",(unsigned int)RTA_DATA(rta));
+      break;
+    default:
+      fprintf(stderr,"unhandled rta type");
+      break;
+    }
+
+    rta = RTA_NEXT(rta,length);
+  }
+  
+}
+
+void netlink_link_is_up(struct intf *intf, struct nlmsghdr *n)
+{
+
+  struct ifinfomsg *i;
+
+  if (n->nlmsg_type != RTM_NEWLINK)
+    return;
+
+  i = NLMSG_DATA(n);
+
+  intf->up = ((i->ifi_flags & IFF_RUNNING) == IFF_RUNNING);
+
+}
+
+int netlink_qualify(struct nlmsghdr *n, size_t length)
+{
+  if (!NLMSG_OK(n, length) || 
+      length < sizeof(struct nlmsghdr) ||
+      length < n->nlmsg_len) {
+    fprintf(stderr,"netlink: packet too small or truncated. %u!=%u!=%u",
+	    length, sizeof(struct nlmsghdr), n->nlmsg_len);
+    return -1;
+  }
+
+  if (n->nlmsg_type == NLMSG_ERROR) {
+    struct nlmsgerr *e = (struct nlmsgerr *) NLMSG_DATA(n);
+	  
+    if (e->error) {
+      fprintf(stderr,"netlink error: %s\n",strerror(-e->error));
+    }
+    return -1;
+  }
+  
+  return 0;
+}
+
+void netlink_addr_add(int nl, struct intf *intf)
+{
+
+  struct in_addr brd;
+
+  struct {
+    struct nlmsghdr  n;
+    struct ifaddrmsg a;
+    char   opts[32];
+  } req;
+
+  if (inet_aton("169.254.255.255", &brd) == 0) {
+    fprintf(stderr,"couldn't generate broadcast address\n");
+    exit(1);
+  }
+
+  memset(&req, 0, sizeof(req));
+
+  req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+  req.n.nlmsg_type = RTM_NEWADDR;
+  req.n.nlmsg_flags = NLM_F_REQUEST;
+
+  req.a.ifa_family = AF_INET;
+  req.a.ifa_prefixlen = 16; /* AIPPA is 169.254.0.0/16 */
+  req.a.ifa_flags = IFA_F_PERMANENT;
+  req.a.ifa_scope = RT_SCOPE_LINK;
+  req.a.ifa_index = intf->index;
+
+  if (addattr_l(&req.n, sizeof(req), 
+		IFA_LOCAL, (void *)&intf->ip, 
+		sizeof(struct in_addr)) < 0) {
+    fprintf(stderr,"addattr_l: unable to add IFA_LOCAL attribute to netlink message\n");
+  }
+
+  if (addattr_l(&req.n, sizeof(req), 
+		IFA_BROADCAST, (void *)&brd,
+		sizeof(struct in_addr)) < 0) {
+    fprintf(stderr,"addattr_l: unable to add IFA_BROADCAST attribute to netlink message\n");
+  }
+
+  if (netlink_send(nl, (struct nlmsghdr *)&req) < 0) {
+    fprintf(stderr,"netlink_send(): %s\n", strerror(errno));
+  }
+
+
+}
+
+void netlink_addr_del(int nl, struct intf *intf)
+{
+  struct in_addr brd;
+
+  struct {
+    struct nlmsghdr  n;
+    struct ifaddrmsg a;
+    char   opts[32];
+  } req;
+
+  if (inet_aton("169.254.255.255", &brd) == 0) {
+    fprintf(stderr,"couldn't generate broadcast address\n");
+    exit(1);
+  }
+
+  memset(&req, 0, sizeof(req));
+
+  req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifaddrmsg));
+  req.n.nlmsg_type = RTM_DELADDR;
+  req.n.nlmsg_flags = NLM_F_REQUEST;
+
+  req.a.ifa_family = AF_INET;
+  req.a.ifa_prefixlen = 16; /* AIPPA is 169.254.0.0/16 */
+  req.a.ifa_flags = IFA_F_PERMANENT;
+  req.a.ifa_scope = RT_SCOPE_LINK;
+  req.a.ifa_index = intf->index;
+
+  if (addattr_l(&req.n, sizeof(req), 
+		IFA_LOCAL, (void *)&intf->ip, 
+		sizeof(struct in_addr)) < 0) {
+    fprintf(stderr,"addattr_l: unable to add IFA_LOCAL attribute to netlink message\n");
+  }
+
+  if (addattr_l(&req.n, sizeof(req), 
+		IFA_BROADCAST, (void *)&brd,
+		sizeof(struct in_addr)) < 0) {
+    fprintf(stderr,"addattr_l: unable to add IFA_BROADCAST attribute to netlink message\n");
+  }
+
+  if (netlink_send(nl, (struct nlmsghdr *)&req) < 0) {
+    fprintf(stderr,"netlink_send(): %s\n", strerror(errno));
+  }
+
+}
+
+int check_ifname_exists(int nl, struct intf *intf)
+{
+
+#if 0
+  /* in theory, the below should work. in practise it doesn't
+   * so we use the more complicated netlink method to get the index
+   */
+  struct ifreq ifr;
+
+  memset( &ifr, 0, sizeof(struct ifreq));
+  strncpy(ifr.ifr_name, int.name, sizeof(ifr.ifr_name));
+
+  if (ioctl(nl, SIOCGIFINDEX, &ifr) < 0) {
+    fprintf(stderr,"ioctl SIOCGIFINDEX failed: %s\n",strerror(errno));
+    return -1;
+  }
+
+  intf->index = ifr.ifr_ifindex;
+
+  if (ioctl(nl, SIOCGIFFLAGS, &ifr) < 0) {
+    fprintf(stderr,"ioctl SIOCGIFINDEX failed: %s\n",strerror(errno));
+    return -1;
+  }
+
+  intf->flags = ifr.ifr_flags;
+
+  return 0;
+#else
+  struct pollfd fds[1];
+
+  struct {
+    struct nlmsghdr  n;
+    struct ifinfomsg i;
+    char             ifnamebuf[NLBUF];
+  } req;
+
+  memset(&req, 0, sizeof(req));
+  req.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+  req.n.nlmsg_flags = NLM_F_REQUEST|NLM_F_MATCH;
+  req.n.nlmsg_type = RTM_GETLINK;
+  req.i.ifi_family = AF_UNSPEC;
+  req.i.ifi_change = 0xffffffff;
+
+  if (addattr_l(&req.n, sizeof(req), IFLA_IFNAME, intf->name, IFNAMSIZ+1) < 0) {
+    fprintf(stderr,"addattr_l: unable to add IFNAME attribute to netlink message\n");
+    return -1;
+  }
+
+  
+  if (netlink_send(nl, (struct nlmsghdr *)&req) < 0) {
+    fprintf(stderr,"netlink_send(): %s\n", strerror(errno));
+    return -1;
+  }
+
+  /* wait up to 5 seconds for the kernel to decide
+   * modprobe or udev might take that long 
+   */
+  fds[0].fd = nl;
+  fds[0].events = POLLIN|POLLERR;
+
+  switch (poll(fds, 1, 5*100)) {
+  case -1:
+    fprintf(stderr,"poll err: %s\n",strerror(errno));
+    exit(1);
+    break;
+  case 0:
+    fprintf(stderr,"couldn't find interface\n");
+    return -1;
+    break;
+  case 1:
+    {
+      /* this is annoyingly complicated */
+      if (verbose)
+	fprintf(stderr,"we got a netlink message in %s\n", __FUNCTION__);
+
+      ssize_t  bytes;
+      char replybuf[4096];
+      struct nlmsghdr *n = (struct nlmsghdr *)&replybuf;
+      struct ifinfomsg *i = NULL;
+      struct rtattr *a = NULL;
+      int l;
+
+
+      if ((bytes = recv(nl, replybuf, sizeof(replybuf), 0)) < 0) {
+	fprintf(stderr,"recv(): %s\n", strerror(errno));
+	return -1;
+      }
+
+      for (; bytes > 0; n = NLMSG_NEXT(n, bytes)) {
+
+	if (netlink_qualify(n, (size_t)bytes)< 0)
+	  return -1;
+	
+	if (n->nlmsg_type == NLMSG_DONE) {
+	  if (verbose)
+	    fprintf(stderr,"finished processing RTM_GETLINK in %s\n",__FUNCTION__);
+	  return intf->index;
+	}
+
+	if (n->nlmsg_type != RTM_NEWLINK) {
+	  fprintf(stderr,"received unexpected %u response\n",n->nlmsg_type);
+	  return -1;
+	}
+
+	i = NLMSG_DATA(n);
+	l = NLMSG_PAYLOAD(n, sizeof(struct ifinfomsg));
+	a = IFLA_RTA(i);
+
+	while (RTA_OK(a,l)) {
+
+	  if (a->rta_type == IFLA_IFNAME) {
+	    if (verbose)
+	      fprintf(stderr,"got iface %d:%s\n",i->ifi_index,(char *)RTA_DATA(a));
+
+	    if (!strncmp(intf->name, RTA_DATA(a), strlen(intf->name))) {
+	      intf->index = i->ifi_index;
+	      intf->flags = i->ifi_flags;
+	      intf->up = ((i->ifi_flags & IFF_RUNNING) == IFF_RUNNING);
+	    } else {
+	      break;
+	    }
+	  }
+
+	  if (a->rta_type == IFLA_ADDRESS) {
+	    unsigned char *addr;
+
+	    addr = (unsigned char *)RTA_DATA(a);
+
+	    intf->mac.ether_addr_octet[0] = addr[0];
+	    intf->mac.ether_addr_octet[1] = addr[1];
+	    intf->mac.ether_addr_octet[2] = addr[2];
+	    intf->mac.ether_addr_octet[3] = addr[3];
+	    intf->mac.ether_addr_octet[4] = addr[4];
+	    intf->mac.ether_addr_octet[5] = addr[5];
+	  }
+
+	  a = RTA_NEXT(a,l);
+	}
+
+      }
+
+      return intf->index;
+
+    }
+    break;
+  default:
+    fprintf(stderr,"something abnormal happened in poll. aborting\n");
+    exit(1);
+    break;
+  }
+
+  return -1;
+#endif
+}
+
+int check_ifname_type(struct intf *intf)
+{
+
+  if ((intf->flags & IFF_NOARP) ||
+      (intf->flags & IFF_LOOPBACK) ||
+      (intf->flags & IFF_SLAVE) ||
+      (intf->flags & IFF_POINTOPOINT))
+    return -1;
+      
+  return 0;
+}
+
+int arp_open(struct intf *intf)
+{
+  int as;
+  struct sockaddr_ll ll;
+
+  if ((as = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_ARP))) < 0) {
+    fprintf(stderr,"arp socket failed: %s\n", strerror(errno));
+    return -1;
+  }
+
+  memset(&ll, 0, sizeof(ll));
+  ll.sll_family = AF_PACKET;
+  ll.sll_ifindex = intf->index;
+
+  if (bind(as, (struct sockaddr *)&ll, sizeof(ll)) < 0) {
+    fprintf(stderr,"arp bind failed: %s\n", strerror(errno));
+    return -1;
+  }
+
+  return as;
+}
+
+void arp_packet_dump(struct arp_packet *pkt)
+{
+
+  if (!pkt)
+    return;
+
+  fprintf(stderr,"%d %d %d %d %d: ",
+	  ntohs(pkt->arp.ar_hrd),
+	  ntohs(pkt->arp.ar_pro),
+	  pkt->arp.ar_hln,
+	  pkt->arp.ar_pln,
+	  ntohs(pkt->arp.ar_op));
+	  
+  /* ARP could possibly have various types of address formats
+   * only Ethernet, IP protocol addresses and
+   * ARP_REQUESTs or ARP_REPLYs are intersting
+   */
+  if ((ntohs(pkt->arp.ar_hrd) != ARPHRD_ETHER) && 
+      (ntohs(pkt->arp.ar_pro) != ARP_IP_PROTO) &&
+      (
+       (ntohs(pkt->arp.ar_op) != ARPOP_REQUEST) || 
+       (ntohs(pkt->arp.ar_op) != ARPOP_REPLY)
+      )
+     ) {
+    fprintf(stderr,"unhandled kind of ARP packet\n");
+    return;
+  }
+
+  fprintf(stderr,"%02X:%02X:%02X:%02X:%02X:%02X",
+	  pkt->sender_mac.ether_addr_octet[0],
+	  pkt->sender_mac.ether_addr_octet[1],
+	  pkt->sender_mac.ether_addr_octet[2],
+	  pkt->sender_mac.ether_addr_octet[3],
+	  pkt->sender_mac.ether_addr_octet[4],
+	  pkt->sender_mac.ether_addr_octet[5]);
+
+  fprintf(stderr," %s", inet_ntoa(pkt->sender_ip));
+
+  fprintf(stderr," -> ");
+
+  fprintf(stderr,"%02X:%02X:%02X:%02X:%02X:%02X",
+	  pkt->target_mac.ether_addr_octet[0],
+	  pkt->target_mac.ether_addr_octet[1],
+	  pkt->target_mac.ether_addr_octet[2],
+	  pkt->target_mac.ether_addr_octet[3],
+	  pkt->target_mac.ether_addr_octet[4],
+	  pkt->target_mac.ether_addr_octet[5]);
+
+  fprintf(stderr," %s", inet_ntoa(pkt->target_ip));
+
+  fprintf(stderr,"\n");
+}
+
+/* while the RFC (and my design) notes that there are three
+ * ways to detect a conflict, those three collapse readily
+ * into just these two required tests
+ */
+int  arp_conflict(struct intf *intf, struct arp_packet *pkt)
+{
+  if (!pkt)
+    return 0;
+
+  if (memcmp(&intf->ip, &pkt->sender_ip, sizeof(struct in_addr) == 0))
+    return 1;
+
+  if ((ntohs(pkt->arp.ar_op) == ARPOP_REQUEST) &&
+      (memcmp(&intf->mac, &pkt->sender_mac, sizeof(struct ether_addr) != 0)) &&
+      (memcmp(&intf->ip, &pkt->target_ip, sizeof(struct in_addr) == 0)))
+    return 1;
+
+  return 0;
+
+}
+
+void arp_packet_send(int as, 
+		     struct intf *intf, 
+		     short int arp_op, 
+		     int null_sender)
+{
+
+  struct arp_packet  ap;
+  struct sockaddr_ll ll;
+
+  memset(&ap, 0, sizeof(struct arp_packet));
+
+  ap.arp.ar_hrd = htons(ARPHRD_ETHER);
+  ap.arp.ar_pro = htons(ARP_IP_PROTO);
+  ap.arp.ar_hln = ETH_ALEN;
+  ap.arp.ar_pln = 4; /* octets in IPv4 address */
+  ap.arp.ar_op = htons(arp_op);
+
+  /* filling with 0xff sets the destination to 
+   * the broadcast link-layer address for free
+   */
+  memset(&ll, 0xff, sizeof(struct sockaddr_ll));
+  ll.sll_family = AF_PACKET;
+  ll.sll_protocol = htons(ETH_P_ARP);
+  ll.sll_ifindex = intf->index;
+  ll.sll_halen = ETH_ALEN; 
+
+  memcpy(&ap.sender_mac, &intf->mac, sizeof(struct ether_addr));
+  memcpy(&ap.target_ip, &intf->ip, sizeof(struct in_addr));
+
+  if (!null_sender)
+    memcpy(&ap.sender_ip, &intf->ip, sizeof(struct in_addr));
+
+  if (sendto(as, (void *)&ap, sizeof(struct arp_packet), 0, (struct sockaddr *)&ll, sizeof(struct sockaddr_ll)) < 0) {
+    fprintf(stderr,"failed to send ARP packet: %s\n", strerror(errno));
+  }
+
+}
+
+void arp_probe(int as, struct intf *intf)
+{
+
+  arp_packet_send(as, intf, ARPOP_REQUEST, 1);
+
+}
+
+void arp_claim(int as, struct intf *intf)
+{
+
+  arp_packet_send(as, intf, ARPOP_REQUEST, 0);
+
+}
+
+void arp_defend(int as, struct intf *intf)
+{
+
+  arp_packet_send(as, intf, ARPOP_REPLY, 0);
+
+}
+
+void usage(void)
+{
+  fprintf(stderr,"usage error\n");
+  fprintf(stderr,"zeroconf [-f|--force] [-v|--verbose] [-n|--no-fork] [-i|--interface] <interface>\n");
+  fprintf(stderr,"where:\n");
+  fprintf(stderr,"\t-f\tforce zeroconf to run on the specified interface\n");
+  fprintf(stderr,"\t-v\treport verbose information\n");
+  fprintf(stderr,"\t-n\tdo not fork into the background\n");
+  fprintf(stderr,"\t-i\twhich interface to run on [required]\n");
+  exit(1);
+}
+
+
+int signal_install(int signo)
+{
+
+  sigset_t         signals;
+  struct sigaction sighdlr = {
+    .sa_handler = sig_handler,
+    .sa_flags = SA_RESTART,
+  };
+
+  if (sigemptyset(&signals) < 0) {
+    fprintf(stderr,"unable to clear signal set: %s\n", strerror(errno));
+    return -1;
+  }
+
+  if (sigaddset(&signals, signo) < 0) {
+    fprintf(stderr,"unable to add signal to set: %s\n", strerror(errno));
+    return -1;
+  }
+
+  if (sigaction(signo, &sighdlr, NULL ) < 0) {
+    fprintf(stderr,"unable to set signal handler: %s\n", strerror(errno));
+    return -1;
+  }
+
+  if (sigprocmask(SIG_UNBLOCK, &signals, NULL) < 0) {
+    fprintf(stderr,"unable to unblock %d: %s\n", signo, strerror(errno));
+    return -1;
+  }
+
+  return 0;
+}
+
+int addattr_l(struct nlmsghdr *n, 
+	      unsigned int maxlen, 
+	      int type, 
+	      const void *data, 
+	      int alen)
+{
+	int len = RTA_LENGTH(alen);
+	struct rtattr *rta;
+
+	if (NLMSG_ALIGN(n->nlmsg_len) + len > maxlen) {
+		fprintf(stderr, "addattr_l ERROR: message exceeded bound of %d\n",maxlen);
+		return -1;
+	}
+	rta = (struct rtattr*)(((char*)n) + NLMSG_ALIGN(n->nlmsg_len));
+	rta->rta_type = type;
+	rta->rta_len = len;
+	memcpy(RTA_DATA(rta), data, alen);
+	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + len;
+	return 0;
+}

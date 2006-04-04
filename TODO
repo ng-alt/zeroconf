@@ -1,107 +1,18 @@
-
-RFC
-- do not enable zeroconf on multiple interfaces by default
-	maybe only support zeroconf on interface used for default route?
-- 2.6 covers link-local/globally routable
-- Of 169.254.0.0/16 prefix, 169.254.0.0/24 and 169.254.255.0.0/24 are
-reserved for compatibility reasons
-	 - does this require an algorithm change for address
-	 generation?
-
-- 2.2.1: address probe state machine
-  initial timeout should be between 0...PROBE_WAIT seconds
-  subsequent timeouts between PROBE_MIN and PROBE_MAX seconds
-  for at most PROBE_NUM packets
-
-  keep listening for ANNOUNCE_WAIT seconds after last probe packet, if
-  anything is received address is in-use, retry up to MAX_COLLISIONS,
-  thereafter once per RATE_LIMIT_INTERVAL seconds
-
-  if nothing received ANNOUNCE_WAIT seconds after last probe packet
-  then begin claiming it
-
-STATES:
-	- performs address probe				     | ADDR_PROBE
-	- after PROBE_NUM packets, listen for ANOUNCE_WAIT seconds   | ADDR_PROBE_WAIT
-	- if timeout (good), => ADDR_CLAIM			     | ADDR_PROBE_WAIT
-	- if I/O received (bad) and we collide => ADDR_PROBE_COLLIDE | ADDR_PROBE_WAIT
-	- increment collide_count, reset nprobes => ADDR_PROBE       | ADDR_PROBE_COLLIDE
-	- after MAX_COLLISIONS, only once per RATE_LIMIT_INTERVAL    | ADDR_PROBE_RATELIMIT
-
-- 2.4: address claim state machine
-  a claim must be sent every ANNOUNCE_INTERVAL seconds for at most
-  ANNOUNCE_NUM times; the timeout interval is NOT modified by any shorter timeouts (especially those in section 2.3)
-
-STATES:
-	- perform address claim					     | ADDR_CLAIM
-	- once complete => ADDR_DEFEND                               | ADDR_CLAIM
-
-zeroconf.c:312 what should target_addr be? broadcast?
-  
-- 2.5: conflicts
-
-If either a request / reply ARP is received for any matching IP address
-
-a. either immediately go back to 2.2.1 (and probe for a new address)
-
-STATES:
-	- we collide => ADDR_PROBE                                   | ADDR_DEFEND
-
-OR
-
-b. if within DEFEND_INTERVAL there was only a single packet received
-MAY send ONE address claim
-
-STATES:
-	- wait DEFEND_INTERVAL seconds                               | ADDR_DEFEND
-	- send ONE address claim => ADDR_DEFEND_FINAL                | ADDR_DEFEND
-        - we collide => ADDR_PROBE				     | ADDR_DEFEND_FINAL
-	
-
-NOTE: All ARP packets must have a link-local broadcast address if the
-sender IP address is link-local
-
-Constants:
-   PROBE_WAIT           1 second   (initial random delay)
-   PROBE_MIN            1 second   (minimum delay till repeated probe)
-   PROBE_MAX            2 seconds  (maximum delay till repeated probe)
-   PROBE_NUM            3          (number of probe packets)
-   ANNOUNCE_NUM         2          (number of announcement packets)
-   ANNOUNCE_INTERVAL    2 seconds  (time between announcement packets)
-   ANNOUNCE_WAIT        2 seconds  (delay before announcing)
-   MAX_COLLISIONS      10          (max collisions before rate limiting)
-   RATE_LIMIT_INTERVAL 60 seconds  (delay between successive attempts)
-   DEFEND_INTERVAL      10 seconds  (minimum interval between defensive
-                                     ARPs).
+How to implement?
 
 
-DEFINITE
-- use syslog for important events (use)
-- use syslog if verbose is specified
-- proper signal handling
-- create /var/run/zeroconf.<iface>.pid
-- go through RFC looking for specification and/or issues
-- make more use of netlink to:
-	- note interface availability
-	- note addresses assigned to an interface
-	- mark an addresses as deprecated
-	- assign addresses only to interface used for default route
-	(what happens with two equal cost default routes?)
+   All ARP packets (*replies* as well as requests) that contain a Link-
+   Local 'sender IP address' MUST be sent using link-layer broadcast
+   instead of link-layer unicast.  This aids timely detection of
+   duplicate addresses.  An example illustrating how this helps is given
+   in Section 4.
 
-- an interface whitelist
+From section 2.6? Change the kernel to know about these addresses?
 
-MAYBE
-- interface to d-bus, broadcat new address claim?
-- use DNAv4?
+Or section 2.6.2? If only a single IPv4LL address per machine, then a
+route entry is fine.  If not routable address but with have link-local
+and are trying to communicate with non link-local, MUST ARP for
+address
 
-CHECK
-- use seconday address 'feature' in 2.6.12
-- does address removal result in session shutdown for TCP?
-- 169.254.0.0/16 on multiple networks; does an ARP occur on each? or on one?
-
-since RFC3927
-- MUST NOT send queries for 254.169.in-addr.arpa
-- DNS servers MUST fail the query
-- link addresses can be now be use for source OR destination; previously only source
-- section 2.6.1 conflicts with the SHOULD NOT requirement mentioned earlier about assigning an interface both an IPv4 routeable and a link-local
-- routers MUST NOT forward if an IPv4ll address is either src or dest.
+Section 2.7:
+	no forwarding of IPv4LL addresses
