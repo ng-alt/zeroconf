@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "delay.h"
 
@@ -23,13 +24,13 @@ void delay_setup_fixed (struct itimerval *delay, int delay_secs)
   memset(delay, 0, sizeof(struct itimerval));
 
   if (verbose)
-    fprintf(stderr,"delay fixed for %d\n",delay_secs);
+    fprintf(stderr, "delay fixed for %d\n", delay_secs);
 
   delay->it_value.tv_sec = delay_secs;
 
 }
 
-void delay_setup_random(struct itimerval *delay, 
+void delay_setup_random(struct itimerval *delay,
 			int delay_min_secs,
 			int delay_max_secs)
 {
@@ -54,7 +55,7 @@ void delay_setup_random(struct itimerval *delay,
     delay->it_value.tv_sec = delay->it_value.tv_sec / 100;
 
   if (verbose)
-    fprintf(stderr,"delay random for %ld.%ld\n",
+    fprintf(stderr, "delay random for %ld.%ld\n",
 	    delay->it_value.tv_sec,
 	    delay->it_value.tv_usec);
 
@@ -96,3 +97,13 @@ int  delay_is_waiting  (void)
   return 0;
 }
 
+void delay_cancel      (void)
+{
+  if (setitimer(ITIMER_REAL, NULL, NULL) < 0) {
+    fprintf(stderr, "failed to cancel timer: %s\n", strerror(errno));
+  }
+
+  delay_timeout = 0;
+  delay_is_running = 0;
+
+}

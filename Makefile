@@ -3,7 +3,7 @@ Q=@
 
 CWARN= -W -Wall -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations -Wchar-subscripts -Wcomment -Wformat=2 -Wno-format-extra-args -Wimplicit-int -Werror-implicit-function-declaration -Wmain -Wmissing-braces -Wparentheses -Wswitch -Wundef -Wshadow -Wwrite-strings
 
-CFLAGS=$(CWARN) -MMD -O2 -g
+CFLAGS=$(CWARN) -std=gnu99 -MMD -O2 -g
 
 SRCS=zeroconf.c delay.c
 

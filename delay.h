@@ -1,14 +1,14 @@
 /*
  * our delay API
- * 
+ *
  * zeroconf requires us to have things outstanding on the network
  * and to wait until a certain amount of time has passed before
- * proceeding. 
+ * proceeding.
  *
- * This API tries to be somewhat sane to use but it has limitations, 
- * like it needs to hane SIGALARM handled specially. It can only
- * have a single delay outstanding as once. Delays are always against
- * observered real-time
+ * This API tries to be somewhat sane to use but it has limitations,
+ * like it needs to have SIGALARM handled specially. It can only
+ * have a single delay outstanding at once. Delays are always against
+ * observed real-time
  */
 
 #ifndef DELAY_H
@@ -21,7 +21,7 @@ extern int delay_is_running;
 
 void delay_setup_fixed (struct itimerval *delay, int delay_secs);
 
-void delay_setup_random(struct itimerval *delay, 
+void delay_setup_random(struct itimerval *delay,
 			int delay_min_secs,
 			int delay_max_secs);
 
@@ -31,6 +31,8 @@ void delay_run         (struct itimerval *delay);
 
 int  delay_is_waiting  (void);
 
-#define delay_wait(x)  { if (!delay_timeout) continue; }
+void delay_cancel      (void);
+
+#define delay_wait()  { if (!delay_timeout) continue; }
 
 #endif /* DELAY_H */
