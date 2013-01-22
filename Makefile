@@ -1,3 +1,5 @@
+include ../config.mk
+include ../config.in
 
 Q=@
 
@@ -12,6 +14,10 @@ OBJS= $(SRCS:.c=.o)
 TARGET=zeroconf
 
 all: $(TARGET)
+
+install:
+	install $(TARGET) $(TARGETDIR)/usr/sbin/
+	$(STRIP) $(TARGETDIR)/usr/sbin/$(TARGET)
 
 clean:
 	rm -f $(TARGET) $(OBJS) *.d
