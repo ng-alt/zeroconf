@@ -104,9 +104,9 @@ int  check_ifname_exists(int nl, struct intf *intf);
 int  check_ifname_type(struct intf *intf);
 int  arp_open(struct intf *intf);
 int  arp_conflict(struct intf *intf, struct arp_packet *pkt);
-/*  added start pling 02/25/2011 */
+/* Foxconn added start pling 02/25/2011 */
 int  arp_conflict_defend(struct intf *intf, struct arp_packet *pkt);
-/*  added end pling 02/25/2011 */
+/* Foxconn added end pling 02/25/2011 */
 void arp_packet_dump(struct arp_packet *pkt);
 void arp_packet_send(int as,
 		     struct intf *intf,
@@ -133,9 +133,9 @@ int address_picked = 0;
 
 int self_pipe[2] = { -1, -1 };
 
-/*  added start pling 03/23/2011 */
+/* Foxconn added start pling 03/23/2011 */
 int use_previous_address = 0;
-/*  added end pling 03/23/2011 */
+/* Foxconn added end pling 03/23/2011 */
 
 static void sig_handler(int signo)
 {
@@ -157,9 +157,9 @@ int main(int argc, char **argv)
     .up = 0,
   };
 
-  /*  added start pling 03/25/2011 */
+  /* Foxconn added start pling 03/25/2011 */
   static int defence_done = 0;
-  /*  added end pling 03/25/2011 */
+  /* Foxconn added end pling 03/25/2011 */
 
   check_args(argc, argv, &intf);
 
@@ -586,13 +586,13 @@ int main(int argc, char **argv)
 
 	zeroconf_counter_reset();
 
-    /*  added start pling 03/23/2011 */
+    /* Foxconn added start pling 03/23/2011 */
     /* Use previous Auto IP address if available */
     if (use_previous_address) {
       use_previous_address = 0;
 	  address_picked = 1;
     } else
-    /*  added end pling 03/23/2011 */
+    /* Foxconn added end pling 03/23/2011 */
 	address_picked = 0;
 
 	state = ADDR_PROBE;
@@ -679,10 +679,10 @@ int main(int argc, char **argv)
 	if (arp_conflict(&intf, pkt)) {
 	  state = ADDR_PROBE;
 
-	  /*  added start pling 03/01/2011 */
+	  /* Foxconn added start pling 03/01/2011 */
 	  /* If addr conflict, we need to choose another auto ip */
 	  address_picked = 0;
-	  /*  added end pling 03/01/2011 */
+	  /* Foxconn added end pling 03/01/2011 */
 
 	  delay_setup_immed(&delay);
 
@@ -728,15 +728,17 @@ int main(int argc, char **argv)
 
 	netlink_addr_add(nl, &intf);
 
+    /* Foxonn added start pling 02/24/2011 */
     /* Tell autoipd that we configured an auto ip */
     system("killall -SIGINT autoipd 2>/dev/null");
+    /* Foxonn added end pling 02/24/2011 */
 
 	state = ADDR_DEFEND;
 
-    /*  added start pling 03/25/2011 */
+    /* Foxconn added start pling 03/25/2011 */
     /* Clear this flag so that 2nd ARP conflict will work */
 	defence_done = 0;
-    /*  added end pling 03/25/2011 */
+    /* Foxconn added end pling 03/25/2011 */
 
 	delay_setup_immed(&delay);
 
@@ -752,7 +754,7 @@ int main(int argc, char **argv)
 	if (verbose)
 	  fprintf(stderr, "entering ADDR_DEFEND\n");
 
-    /*  modified start pling 02/25/2011 */
+    /* Foxconn modified start pling 02/25/2011 */
     /* At DEFEND state, RFC requires only compare 
      * ARP's sender IP and our IP.
      * So we should not use the common
@@ -762,7 +764,7 @@ int main(int argc, char **argv)
 	if (arp_conflict(&intf, pkt)) 
 #endif
 	if (arp_conflict_defend(&intf, pkt)) {
-    /*  modified end pling 02/25/2011 */
+    /* Foxconn modified end pling 02/25/2011 */
 
 	  arp_defend(as, &intf);
 
@@ -782,10 +784,10 @@ int main(int argc, char **argv)
     case ADDR_FINAL:
       {
 
-    /*  removed start pling 03/25/2011 */
+    /* Foxconn removed start pling 03/25/2011 */
     /* Make this variable global to this function */
 	/* static int defence_done = 0; */
-    /*  removed end pling 03/25/2011 */
+    /* Foxconn removed end pling 03/25/2011 */
 
 	if (verbose)
 	  fprintf(stderr, "entering ADDR_FINAL\n");
@@ -903,7 +905,7 @@ void check_args(int argc, char * const argv[], struct intf *intf)
       nofork = 1;
       break;
     case 'p':
-      /*  modified start pling 03/23/2011 */
+      /* Foxconn modified start pling 03/23/2011 */
       /* Use previous auto ip address if available */
 #if 0
       fprintf(stderr, "XXX: not implemented\n"); /* TODO */
@@ -913,7 +915,7 @@ void check_args(int argc, char * const argv[], struct intf *intf)
           use_previous_address = 1;
           //fprintf(stderr, "intf->ip=%u\n", intf->ip.s_addr);
       }
-      /*  modified end pling 03/23/2011 */
+      /* Foxconn modified end pling 03/23/2011 */
       break;
     case 'v':
       verbose = 1;
@@ -1627,7 +1629,7 @@ int  arp_conflict(struct intf *intf, struct arp_packet *pkt)
    * handles 2.5  : ARP packet (request of reply)
    * sender IP is our probe address
    */
-  /*  modified start pling 02/25/2011 */
+  /* Foxconn modified start pling 02/25/2011 */
   /* In addition to packet "sender IP" == Interface IP, 
    * add condition: packet "src MAC" != Interface MAC
    */
@@ -1636,7 +1638,7 @@ int  arp_conflict(struct intf *intf, struct arp_packet *pkt)
 #endif
   if ((memcmp(&intf->ip, &pkt->sender_ip, sizeof(struct in_addr)) == 0) &&
       (memcmp(&intf->mac, &pkt->sender_mac, sizeof(struct ether_addr)) != 0))
-  /*  modified end pling 02/25/2011 */
+  /* Foxconn modified end pling 02/25/2011 */
   {
     printf("ARP conflict#1: sender IP:%ssender MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
             inet_ntoa(pkt->sender_ip),
@@ -1672,7 +1674,7 @@ int  arp_conflict(struct intf *intf, struct arp_packet *pkt)
 
 }
 
-/*  added start pling 02/25/2011 */
+/* Foxconn added start pling 02/25/2011 */
 /* At DEFEND state, we only check the ARP packet's
  * sender IP is same as our IP or not.
  */
