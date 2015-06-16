@@ -1471,6 +1471,9 @@ int check_ifname_exists(int nl, struct intf *intf)
   fds[0].fd = nl;
   fds[0].events = POLLIN|POLLERR;
 
+/*foxconn Han edited, 06/01/2015 read again when interface can not found*/
+read_again:
+
   switch (poll(fds, 1, 5*100)) {
   case -1:
     fprintf(stderr, "poll err: %s\n", strerror(errno));
@@ -1515,6 +1518,14 @@ int check_ifname_exists(int nl, struct intf *intf)
 
       }
 
+    
+      /*foxconn Han edited, 06/01/2015 read again when interface can not found*/
+      if(intf->index < 0)
+      {
+        fprintf(stderr, "read again\n");
+        goto read_again;
+      }
+      else
       return intf->index;
 
     }
